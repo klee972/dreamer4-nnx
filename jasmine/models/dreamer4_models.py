@@ -17,6 +17,7 @@ import orbax.checkpoint as ocp
 from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
 
 
+
 class Modality(IntEnum):
     LATENT   = -1
     IMAGE    = 0
@@ -122,17 +123,19 @@ def _get_rotary_positional_encoding(
     """
     assert head_dim % 2 == 0, "head_dim must be even for RoPE"
     
-    # Precompute inverse frequencies: θ_i = base^(-2i/d) for i in [0, d/2)
+    # Precompute in float32 for numerical precision, then cast to target dtype.
+    # Exponentiation and trigonometric functions are sensitive to bfloat16 precision loss.
     half_dim = head_dim // 2
-    inv_freq = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=dtype) / half_dim))
+    inv_freq = 1.0 / (base ** (jnp.arange(0, half_dim, dtype=jnp.float32) / half_dim))
     
     # Precompute position * frequency table: (max_len, half_dim)
-    positions = jnp.arange(max_len, dtype=dtype)
+    positions = jnp.arange(max_len, dtype=jnp.float32)
     freqs = jnp.outer(positions, inv_freq)  # (max_len, half_dim)
     
-    # Precompute cos and sin: (max_len, half_dim)
-    cos_cached = jnp.cos(freqs).astype(dtype)
-    sin_cached = jnp.sin(freqs).astype(dtype)
+    # Precompute and cache cos/sin in float32 for maximum precision.
+    # Cast to target dtype only at the point of use (multiplication with q/k).
+    cos_cached = jnp.cos(freqs)  # (max_len, half_dim), float32
+    sin_cached = jnp.sin(freqs)  # (max_len, half_dim), float32
     
     def _rotate_half(x: jax.Array) -> jax.Array:
         """Rotate half the hidden dims of x: [x1, x2, x3, x4] -> [-x2, x1, -x4, x3]"""
@@ -180,6 +183,10 @@ def _get_rotary_positional_encoding(
         else:
             cos = cos[..., None, :]  # (..., seq_len, 1, head_dim)
             sin = sin[..., None, :]
+        
+        # Cast to target dtype right before multiplication with q/k
+        cos = cos.astype(dtype)
+        sin = sin.astype(dtype)
         
         # Apply rotation: x * cos + rotate_half(x) * sin
         q_rotated = q * cos + _rotate_half(q) * sin
@@ -840,7 +847,7 @@ class TokenizerDreamer4(nnx.Module):
         query_tokens_repeated = einops.repeat(self.query_tokens.value, "N M -> B T N M", B=B, T=T)
         z_BTSM = jnp.concatenate([query_tokens_repeated, z_BTNlM], axis=2)
         recon_BTSM = self.decoder(z_BTSM)
-        recon_BTNM = recon_BTSM[:, :, self.num_latent_tokens:]
+        recon_BTNM = recon_BTSM[:, :, :-self.num_latent_tokens]
         recon_BTNP = self.decoder_proj(recon_BTNM)
         recon_BTNP = recon_BTNP.astype(jnp.float32)
         recon_BTNP = nnx.sigmoid(recon_BTNP)

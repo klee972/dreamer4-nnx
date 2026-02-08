@@ -1,3 +1,0 @@
-[submodule "third_party/dopamine"]
-	path = third_party/dopamine
-	url = https://github.com/p-doom/dopamine

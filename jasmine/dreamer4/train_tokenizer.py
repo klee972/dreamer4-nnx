@@ -35,6 +35,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -47,8 +48,8 @@ class Args:
     # data_dir: str = "data/data/coinrun_episodes/train"
     data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
-    restore_ckpt: bool = True
-    restore_step: int = 19000
+    restore_ckpt: bool = False
+    restore_step: int = 0
     # Optimization
     batch_size: int = 48
     init_lr: float = 0.0
@@ -59,6 +60,7 @@ class Args:
     )
     lr_schedule: str = "wsd"  # supported options: wsd, cos
     warmup_steps: int = 10000
+    optimizer: str = "muon"  # supported options: adamw, muon
     # Tokenizer
     model_dim: int = 512
     mlp_ratio: int = 4
@@ -74,7 +76,7 @@ class Args:
     dtype = jnp.bfloat16
     use_flash_attention: bool = True
     lpips_weight: float = 0.2
-    lpips_subsample_frac: float = 0.5
+    lpips_subsample_frac: float = 1
     pos_emb_type: str = "rope"
     # Logging
     log: bool = True
@@ -132,13 +134,27 @@ def build_optimizer(model: TokenizerDreamer4, args: Args) -> nnx.ModelAndOptimiz
         args.warmup_steps,
         args.wsd_decay_steps,
     )
-    tx = optax.adamw(
-        learning_rate=lr_schedule,
-        b1=0.9,
-        b2=0.9,
-        weight_decay=1e-4,
-        mu_dtype=args.param_dtype,  # moments in full precision
-    )
+    if args.optimizer == "adamw":
+        tx = optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.9,
+            weight_decay=1e-4,
+            mu_dtype=args.param_dtype,
+        )
+    elif args.optimizer == "muon":
+        muon_tx = optax.contrib.muon(learning_rate=lr_schedule, mu_dtype=args.param_dtype)
+        # Wrap init to strip NNX Variables before calling muon's init.
+        # muon uses combine.partition which creates Param(MaskedNode) when
+        # params contain Variables, causing to_opt_state to fail.
+        # Optimizer.update already strips Variables via nnx.to_arrays(nnx.pure(...)),
+        # so we only need to fix init.
+        original_init = muon_tx.init
+        def _compat_init(params):
+            return original_init(nnx.to_arrays(nnx.pure(params)))
+        tx = optax.GradientTransformation(_compat_init, muon_tx.update)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}. Supported: adamw, muon")
     optimizer = nnx.ModelAndOptimizer(model, tx)
     return optimizer
 
@@ -362,33 +378,21 @@ def main(args: Args) -> None:
 
     if args.lpips_weight > 0.0:
         lpips_loss_fn = LPIPS(pretrained_network="alexnet")
-        def lpips_on_mae_recon(pred, target):
-            """
-            pred:    (B,T,H,W,C)
-            target:  (B,T,H,W,C)
-            Returns scalar LPIPS averaged over (B,T).
-            """
-            # Optional subsample frames over T to save compute
-            if args.lpips_subsample_frac < 1.0:
+        def lpips_on_mae_recon(pred, target, rng, training: bool):
+            if args.lpips_subsample_frac < 1.0 and training:
                 B, T = pred.shape[:2]
-                step = max(1, int(1.0/args.lpips_subsample_frac))
-                idx = jnp.arange(T)[::step]
+                K = max(1, int(round(T * args.lpips_subsample_frac)))  # static
+                perm = jax.random.permutation(rng, T)
+                idx = jnp.sort(perm[:K])  # shape (K,)
                 pred = pred[:, idx]
                 target = target[:, idx]
 
-            # Rescale to [-1,1] for LPIPS
             recon_lp = jnp.clip(pred * 2.0 - 1.0, -1.0, 1.0)
             target_lp = jnp.clip(target * 2.0 - 1.0, -1.0, 1.0)
-
-            # Flatten B,T for a single LPIPS call: (B*T,H,W,C)
             BT = recon_lp.shape[0] * recon_lp.shape[1]
-            H_, W_, C_ = recon_lp.shape[2], recon_lp.shape[3], recon_lp.shape[4]
-            recon_lp = recon_lp.reshape((BT, H_, W_, C_))
-            target_lp = target_lp.reshape((BT, H_, W_, C_))
-
-            # LPIPS returns per-example loss; average it
-            lp = lpips_loss_fn(recon_lp, target_lp)  # shape (BT,)
-            return jnp.mean(lp)
+            recon_lp = recon_lp.reshape((BT, *recon_lp.shape[2:]))
+            target_lp = target_lp.reshape((BT, *target_lp.shape[2:]))
+            return jnp.mean(lpips_loss_fn(recon_lp, target_lp))
 
     # --- Define loss and train step (close over args) ---
     def tokenizer_loss_fn(
@@ -402,7 +406,7 @@ def main(args: Args) -> None:
 
         lpips_loss = 0.0
         if args.lpips_weight > 0.0:
-            lpips_loss = lpips_on_mae_recon(outputs["recon"], gt)
+            lpips_loss = lpips_on_mae_recon(outputs["recon"], gt, inputs["rng"], training)
 
         loss = mse + args.lpips_weight * lpips_loss
 
@@ -631,3 +635,4 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     args = tyro.cli(Args)
     main(args)
+

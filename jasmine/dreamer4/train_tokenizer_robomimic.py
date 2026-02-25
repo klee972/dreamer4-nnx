@@ -23,7 +23,7 @@ import flax.nnx as nnx
 from jaxlpips import LPIPS
 
 from jasmine.models.dreamer4_models import TokenizerDreamer4
-from jasmine.utils.dataloader import get_dataloader, get_video_dataloader
+from jasmine.utils.robomimic_dataloader import get_robomimic_dataloader
 from jasmine.utils.train_utils import (
     get_lr_schedule,
     count_parameters_by_component,
@@ -39,38 +39,53 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 150_000
+    num_steps: int = 200_000
     seed: int = 0
-    seq_len: int = 64
+    seq_len: int = 32
     image_channels: int = 3
-    # image_height: int = 224
-    # image_width: int = 384
-    image_height: int = 112
-    image_width: int = 192
-    data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
+    image_height: int = 84
+    image_width: int = 84
     save_ckpt: bool = True
     restore_ckpt: bool = False
     restore_step: int = 0
+    # Robomimic data
+    hdf5_paths: list[str] = field(default_factory=lambda: [
+        # lift (ph, mh, mg)
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/ph/image_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mh/image_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mg/image_sparse_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/lift/mg/image_dense_v15.hdf5",
+        # can (ph, mh, mg, paired)
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/ph/image_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mh/image_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mg/image_sparse_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/mg/image_dense_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/can/paired/image_v15.hdf5",
+        # square (ph, mh)
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/square/ph/image_v15.hdf5",
+        "/home/4bkang/rl/jasmine/robomimic_repo/datasets/square/mh/image_v15.hdf5",
+    ])
+    image_key: str = "agentview_image"
+    filter_key: str = "train"
+    val_filter_key: str = "valid"
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
     max_lr: float = 3e-4
     decay_end: float = 0.0
-    wsd_decay_steps: int = (
-        30_000  # NOTE: wsd_decay_steps will only be used when using a wsd-schedule
-    )
+    wsd_decay_steps: int = 30_000
     lr_schedule: str = "wsd"  # supported options: wsd, cos
     warmup_steps: int = 6000
     optimizer: str = "adamw"  # supported options: adamw, muon
     # Tokenizer
-    model_dim: int = 768
+    model_dim: int = 512
     mlp_ratio: int = 4
-    latent_dim: int = 64
-    num_latent_tokens: int = 32
+    latent_dim: int = 32
+    num_latent_tokens: int = 16
     time_every: int = 4
-    patch_size: int = 16
-    num_blocks: int = 12
-    num_heads: int = 12
+    patch_size: int = 7
+    num_blocks: int = 4
+    num_heads: int = 8
     dropout: float = 0.0
     max_mask_ratio: float = 0.9
     param_dtype = jnp.float32
@@ -83,20 +98,17 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "tokenizer_dreamer4_minecraft_112p"
-    tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4"])
+    name: str = "tokenizer_dreamer4_robomimic"
+    tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4", "robomimic"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft_112p/dreamer4/tokenizer"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/robomimic/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
-    log_checkpoint_keep_period: int = 10_000
+    log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
-
-
 
 
 def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerDreamer4, jax.Array]:
@@ -145,11 +157,6 @@ def build_optimizer(model: TokenizerDreamer4, args: Args) -> nnx.ModelAndOptimiz
         )
     elif args.optimizer == "muon":
         muon_tx = optax.contrib.muon(learning_rate=lr_schedule, mu_dtype=args.param_dtype)
-        # Wrap init to strip NNX Variables before calling muon's init.
-        # muon uses combine.partition which creates Param(MaskedNode) when
-        # params contain Variables, causing to_opt_state to fail.
-        # Optimizer.update already strips Variables via nnx.to_arrays(nnx.pure(...)),
-        # so we only need to fix init.
         original_init = muon_tx.init
         def _compat_init(params):
             return original_init(nnx.to_arrays(nnx.pure(params)))
@@ -185,33 +192,17 @@ def shard_optimizer_states(
     nnx.update(optimizer, optimizer_sharded_state)
 
 
-def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
-    image_shape = (args.image_height, args.image_width, args.image_channels)
-    # array_record_files = [
-    #     os.path.join(data_dir, x)
-    #     for x in os.listdir(data_dir)
-    #     if x.endswith(".array_record")
-    # ]
-    # grain_dataloader = get_dataloader(
-    #     array_record_files,
-    #     args.seq_len,
-    #     # NOTE: We deliberately pass the global batch size
-    #     # The dataloader shards the dataset across all processes
-    #     args.batch_size,
-    #     *image_shape,
-    #     num_workers=8,
-    #     prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
-    #     seed=args.seed,
-    # )
-    grain_dataloader = get_video_dataloader(
-        data_dir,
-        args.seq_len,
-        # NOTE: We deliberately pass the global batch size
-        # The dataloader shards the dataset across all processes
-        args.batch_size,
-        *image_shape,
+def build_dataloader(args: Args, filter_key: str) -> grain.DataLoaderIterator:
+    grain_dataloader = get_robomimic_dataloader(
+        hdf5_paths=args.hdf5_paths,
+        seq_len=args.seq_len,
+        global_batch_size=args.batch_size,
+        image_key=args.image_key,
+        image_h=args.image_height,
+        image_w=args.image_width,
+        filter_key=filter_key,
         num_workers=8,
-        prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
+        prefetch_buffer_size=8,
         seed=args.seed,
     )
     initial_state = grain_dataloader._create_initial_state()
@@ -238,21 +229,16 @@ def build_checkpoint_manager(args: Args) -> Optional[ocp.CheckpointManager]:
             grain.checkpoint.CheckpointRestore,
             cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler),
         )
-        if args.val_data_dir:
-            handler_registry.add(
-                "val_dataloader_state",
-                grain.checkpoint.CheckpointSave,
-                cast(
-                    ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler
-                ),
-            )
-            handler_registry.add(
-                "val_dataloader_state",
-                grain.checkpoint.CheckpointRestore,
-                cast(
-                    ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler
-                ),
-            )
+        handler_registry.add(
+            "val_dataloader_state",
+            grain.checkpoint.CheckpointSave,
+            cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler),
+        )
+        handler_registry.add(
+            "val_dataloader_state",
+            grain.checkpoint.CheckpointRestore,
+            cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler),
+        )
         checkpoint_options = ocp.CheckpointManagerOptions(
             save_interval_steps=args.log_checkpoint_interval,
             max_to_keep=3,
@@ -310,11 +296,13 @@ def restore_checkpoint_if_needed(
 
 
 def main(args: Args) -> None:
-    # jax.distributed.initialize()
     num_devices = jax.device_count()
     if num_devices == 0:
         raise ValueError("No JAX devices found.")
     print(f"Running on {num_devices} devices.")
+
+    if not args.hdf5_paths:
+        raise ValueError("No HDF5 paths provided. Use --hdf5-paths to specify robomimic dataset files.")
 
     if args.batch_size % num_devices != 0:
         raise ValueError(
@@ -367,10 +355,10 @@ def main(args: Args) -> None:
     checkpoint_manager = build_checkpoint_manager(args)
 
     # --- Create DataLoaderIterator from dataloader ---
-    train_iterator = build_dataloader(args, args.data_dir)
+    train_iterator = build_dataloader(args, args.filter_key)
     val_iterator = None
-    if args.val_data_dir:
-        val_iterator = build_dataloader(args, args.val_data_dir)
+    if args.val_filter_key:
+        val_iterator = build_dataloader(args, args.val_filter_key)
 
     # --- Restore checkpoint ---
     step, optimizer, train_iterator, val_iterator = restore_checkpoint_if_needed(
@@ -636,4 +624,3 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     args = tyro.cli(Args)
     main(args)
-

@@ -9,7 +9,7 @@ dependencies = [
   "jax[cuda]==0.7.2",
   "optax>=0.2.3",
   "tyro>=0.8.5",
-  "wandb>=0.17.4",
+  "wandb[media]>=0.17.4",
   "grain==0.2.10",
   "array-record>=0.7.2",
   "pre-commit>=4.2.0",
@@ -23,8 +23,7 @@ dependencies = [
   "torchaudio",
   "diffusers==0.34.0",
   "huggingface-hub>=0.27.0",
-  "robomimic",
-  "robosuite==1.5.1",
+  "robosuite==1.4.1",
 ]
 
 [build-system]
@@ -44,7 +43,6 @@ minerl = { git = "https://github.com/minerllabs/minerl" }
 torch = { index = "pytorch-cu121" }
 torchvision = { index = "pytorch-cu121" }
 torchaudio = { index = "pytorch-cu121" }
-robomimic = { git = "https://github.com/ARISE-Initiative/robomimic.git" }
 
 [tool.uv]
 override-dependencies = [

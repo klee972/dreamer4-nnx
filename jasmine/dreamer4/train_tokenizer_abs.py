@@ -36,6 +36,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -43,14 +44,12 @@ class Args:
     seed: int = 0
     seq_len: int = 64
     image_channels: int = 3
-    # image_height: int = 224
-    # image_width: int = 384
-    image_height: int = 112
-    image_width: int = 192
+    image_height: int = 224
+    image_width: int = 384
     data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
-    restore_ckpt: bool = False
-    restore_step: int = 0
+    restore_ckpt: bool = True
+    restore_step: int = 120000
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -79,23 +78,28 @@ class Args:
     lpips_weight: float = 0.2
     lpips_subsample_frac: float = 1
     pos_emb_type: str = "rope"
+    # LOVE temporal compression
+    num_abs_tokens: int = 16           # Nl_abs tokens (must be < num_latent_tokens)
+    boundary_prior: float = 0.1        # prior boundary prob (~1 / avg_segment_len)
+    boundary_kl_weight: float = 0.01   # weight for KL(boundary || prior)
+    infocost_weight: float = 0.001     # weight for ||z_raw_abs||^2 / 2 rate term
+    love_warmup_steps: int = 10000     # steps to linearly ramp LOVE losses to full weight
     # Logging
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "tokenizer_dreamer4_minecraft_112p"
+    name: str = "tokenizer_dreamer4_minecraft"
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft_112p/dreamer4/tokenizer"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
     log_checkpoint_interval: int = 1000
-    log_checkpoint_keep_period: int = 10_000
+    log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
     val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
     val_interval: int = 20_000
     val_steps: int = 50
-    wandb_id: str = ""
-
+    wandb_id: str = "oio8gc6v"
 
 
 
@@ -121,6 +125,8 @@ def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerDreamer4, jax.Arra
         use_flash_attention=args.use_flash_attention,
         rngs=rngs,
         pos_emb_type=args.pos_emb_type,
+        num_abs_tokens=args.num_abs_tokens,
+        boundary_prior=args.boundary_prior,
     )
     return tokenizer, rng
 
@@ -395,6 +401,24 @@ def main(args: Args) -> None:
             target_lp = target_lp.reshape((BT, *target_lp.shape[2:]))
             return jnp.mean(lpips_loss_fn(recon_lp, target_lp))
 
+    # --- LOVE loss helpers ---
+    def boundary_kl_loss(boundary_prob_BT: jax.Array) -> jax.Array:
+        """KL(Bernoulli(b) || Bernoulli(prior)) — drives boundary sparsity."""
+        eps = 1e-6
+        prior = args.boundary_prior
+        b = jnp.clip(boundary_prob_BT, eps, 1.0 - eps)
+        return jnp.mean(
+            b * (jnp.log(b) - jnp.log(prior))
+            + (1.0 - b) * (jnp.log(1.0 - b) - jnp.log(1.0 - prior))
+        )
+
+    def infocost_loss(
+        boundary_hard_BT: jax.Array, z_raw_abs_BTNabsL: jax.Array
+    ) -> jax.Array:
+        """Gaussian prior rate: ||z_raw_abs||^2/2, paid only at new-option boundaries."""
+        rate_BT = (z_raw_abs_BTNabsL ** 2).mean(axis=(2, 3)) / 2.0  # (B, T)
+        return jnp.mean(boundary_hard_BT * rate_BT)
+
     # --- Define loss and train step (close over args) ---
     def tokenizer_loss_fn(
         model: TokenizerDreamer4, inputs: dict, training: bool = False
@@ -409,18 +433,36 @@ def main(args: Args) -> None:
         if args.lpips_weight > 0.0:
             lpips_loss = lpips_on_mae_recon(outputs["recon"], gt, inputs["rng"], training)
 
-        loss = mse + args.lpips_weight * lpips_loss
+        # --- LOVE losses with linear warmup ---
+        b_kl   = boundary_kl_loss(outputs["boundary_prob"])
+        i_cost = infocost_loss(outputs["boundary_hard"], outputs["z_raw_abs"])
+        step   = inputs.get("step", args.love_warmup_steps)
+        ramp   = jnp.clip(step / args.love_warmup_steps, 0.0, 1.0)
+
+        loss = (
+            mse
+            + args.lpips_weight * lpips_loss
+            + args.boundary_kl_weight * ramp * b_kl
+            + args.infocost_weight * ramp * i_cost
+        )
 
         gt_clipped = gt.clip(0, 1).reshape(-1, *gt.shape[2:])
         recon = outputs["recon"].clip(0, 1).reshape(-1, *outputs["recon"].shape[2:])
         psnr = jnp.asarray(pix.psnr(gt_clipped, recon)).mean()
         ssim = jnp.asarray(pix.ssim(gt_clipped, recon)).mean()
 
+        avg_boundary_prob = outputs["boundary_prob"].mean()
+        avg_segment_len   = 1.0 / jnp.clip(avg_boundary_prob, 1e-4, 1.0)
+
         metrics = dict(
             mse=mse,
             lpips=lpips_loss,
             psnr=psnr,
             ssim=ssim,
+            boundary_kl=b_kl,
+            infocost=i_cost,
+            avg_boundary_prob=avg_boundary_prob,
+            avg_segment_len=avg_segment_len,
             loss=loss,
         )
 
@@ -511,6 +553,7 @@ def main(args: Args) -> None:
         rng, _rng = jax.random.split(rng)
         first_batch = next(dataloader_train)
         first_batch["rng"] = _rng
+        first_batch["step"] = jnp.array(step, dtype=jnp.int32)
         compiled = train_step.lower(optimizer, first_batch).compile()
         print_compiled_memory_stats(compiled.memory_analysis())
         print_compiled_cost_analysis(compiled.cost_analysis())
@@ -523,6 +566,7 @@ def main(args: Args) -> None:
             # --- Train step ---
             rng, _rng = jax.random.split(rng)
             batch["rng"] = _rng
+            batch["step"] = jnp.array(step, dtype=jnp.int32)
             loss, recon, metrics = train_step(optimizer, batch)
             if step == first_step:
                 print_mem_stats("After params initialized")

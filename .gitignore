@@ -15,4 +15,5 @@ ckpts/
 logs/
 wandb/
 __pycache__/
-robomimic/
+robomimic_repo/
+keyframe_selector/

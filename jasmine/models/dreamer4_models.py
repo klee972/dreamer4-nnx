@@ -688,7 +688,7 @@ class TokenizerDreamer4(nnx.Module):
         dtype: jnp.dtype,
         use_flash_attention: bool,
         rngs: nnx.Rngs,
-        pos_emb_type: str = "sinusoidal",  # "sinusoidal", "rope", or "none"
+        pos_emb_type: str = "rope",  # "sinusoidal", "rope", or "none"
     ):
         self.in_dim = in_dim
         self.image_height = image_height
@@ -1499,6 +1499,60 @@ class ActionEncoder(nnx.Module):
         return out
 
 
+class HierarchicalActionEncoder(nnx.Module):
+    """
+    Hierarchical action encoder for Minecraft.
+
+    Expects actions of shape (B, T, 2) where the last dimension is
+    [button_idx, camera_idx].  Button and camera tokens are embedded with
+    separate tables and summed together with a shared base embedding,
+    matching the interface of ActionEncoder so that DynamicsDreamer4 can
+    swap between the two transparently.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_buttons: int,
+        n_camera: int,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        shift_time_by_one: bool,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.shift_time_by_one = shift_time_by_one
+        self.base_action_emb = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (d_model,))
+        )
+        self.emb_buttons = nnx.Embed(n_buttons, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+        self.emb_camera = nnx.Embed(n_camera, d_model, param_dtype=param_dtype, dtype=dtype, rngs=rngs)
+
+    def __call__(
+        self,
+        actions: Optional[jnp.ndarray] = None,  # (B, T, 2): [button_idx, camera_idx]
+        batch_time_shape: Optional[Tuple[int, int]] = None,
+        as_tokens: bool = True,
+    ):
+        if actions is None:
+            assert batch_time_shape is not None
+            B, T = batch_time_shape
+            out = jnp.broadcast_to(self.base_action_emb.value, (B, T, self.d_model))
+        else:
+            button_idx = actions[:, :, 0]  # (B, T)
+            camera_idx = actions[:, :, 1]  # (B, T)
+            emb_button = self.emb_buttons(button_idx)  # (B, T, d_model)
+            emb_cam = self.emb_camera(camera_idx)      # (B, T, d_model)
+            if self.shift_time_by_one:
+                emb_button = jnp.pad(emb_button[:, :-1, :], ((0, 0), (1, 0), (0, 0)))
+                emb_cam = jnp.pad(emb_cam[:, :-1, :], ((0, 0), (1, 0), (0, 0)))
+            out = emb_button + emb_cam + self.base_action_emb.value
+
+        if as_tokens:
+            out = out[:, :, None, :]
+        return out
+
+
 class DynamicsDreamer4(nnx.Module):
     def __init__(
         self,
@@ -1511,7 +1565,7 @@ class DynamicsDreamer4(nnx.Module):
         n_actions: int,
         depth: int,
         k_max: int,
-        rngs: nnx.Rngs, 
+        rngs: nnx.Rngs,
         dropout: float = 0.0,
         mlp_ratio: int = 4,
         time_every: int = 4,
@@ -1521,6 +1575,7 @@ class DynamicsDreamer4(nnx.Module):
         use_flash_attention: bool = True,
         shift_action_tokens_by_one: bool = False,
         pos_emb_type: str = "sinusoidal",  # "sinusoidal", "rope", or "none"
+        n_camera: Optional[int] = None,    # If set, use HierarchicalActionEncoder (Minecraft)
     ):
         """
         Pretrain script: instantiate with space_mode="wm_agent_isolated" and pass agent_tokens=None (dummy).
@@ -1547,10 +1602,17 @@ class DynamicsDreamer4(nnx.Module):
         self.time_every = time_every
         self.pos_emb_type = pos_emb_type
         self.spatial_proj = nnx.Linear(d_spatial, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
-        self.action_encoder = ActionEncoder(
-            d_model=d_model, n_keyboard=n_actions, dtype=dtype, param_dtype=param_dtype, 
-            rngs=rngs, shift_time_by_one=shift_action_tokens_by_one
-        )
+        if n_camera is not None:
+            self.action_encoder = HierarchicalActionEncoder(
+                d_model=d_model, n_buttons=n_actions, n_camera=n_camera,
+                dtype=dtype, param_dtype=param_dtype,
+                shift_time_by_one=shift_action_tokens_by_one, rngs=rngs,
+            )
+        else:
+            self.action_encoder = ActionEncoder(
+                d_model=d_model, n_keyboard=n_actions, dtype=dtype, param_dtype=param_dtype,
+                rngs=rngs, shift_time_by_one=shift_action_tokens_by_one,
+            )
         self.register_tokens = nnx.Param(
             nnx.initializers.normal(0.02)(rngs.params(), (n_register, d_model))
         )
@@ -1598,20 +1660,19 @@ class DynamicsDreamer4(nnx.Module):
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
         self.signal_embed = nnx.Embed(k_max + 1, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
         self.flow_x_head = nnx.Linear(
-            d_model, 
-            d_spatial, 
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.zeros,
+            d_model,
+            d_spatial,
             dtype=dtype,
             param_dtype=param_dtype,
             rngs=rngs
         )
 
+
     def __call__(
         self,
         actions: jnp.ndarray,            # (B,T) - or whatever expected shape
-        step_idxs: jnp.ndarray,          # (B,T)
-        signal_idxs: jnp.ndarray,        # (B,T)
+        step_idxs: jnp.ndarray,          # (B,T) - time step d idxs
+        signal_idxs: jnp.ndarray,        # (B,T) - step size τ idxs
         packed_enc_tokens: jnp.ndarray,  # (B,T,n_s,d_spatial)
         *,
         agent_tokens: Optional[jnp.ndarray] = None,
@@ -1844,7 +1905,7 @@ def restore_dreamer4_tokenizer(
     Returns:
         Restored TokenizerDreamer4 model with pre-trained weights.
     """
-    from jasmine.models.tokenizer import TokenizerDreamer4
+    from jasmine.models.dreamer4_models import TokenizerDreamer4
     
     rngs = nnx.Rngs(rng)
     
@@ -1881,8 +1942,9 @@ def restore_dreamer4_tokenizer(
         dtype=args.dtype,
         use_flash_attention=args.use_flash_attention,
         rngs=rngs,
+        pos_emb_type=getattr(args, 'pos_emb_type', 'sinusoidal'),
     )
-    
+
     # Wrap in ModelAndOptimizer to match checkpoint format
     # The checkpoint was saved as nnx.state(optimizer) where optimizer is ModelAndOptimizer
     tx = optax.adamw(learning_rate=1e-4)  # Dummy optimizer, we only need its structure
@@ -1892,12 +1954,22 @@ def restore_dreamer4_tokenizer(
         dummy_optimizer_state, sharding
     )
     
+    # Build per-leaf restore args that explicitly specify the target sharding.
+    # Using ocp.ArrayRestoreArgs (rather than relying on ShapeDtypeStruct.sharding)
+    # is necessary when restoring a checkpoint saved on a different number of devices.
+    restore_args_tree = jax.tree_util.tree_map(
+        lambda _: ocp.ArrayRestoreArgs(sharding=sharding),
+        dummy_optimizer_state,
+    )
+
     # Restore the checkpoint
     restored_optimizer_state = tokenizer_checkpoint_manager.restore(
         step=tokenizer_checkpoint_manager.latest_step(),
         args=ocp.args.Composite(
             model_state=ocp.args.PyTreeRestore(  # type: ignore
-                abstract_sharded_optimizer_state, partial_restore=True  # type: ignore
+                abstract_sharded_optimizer_state,
+                partial_restore=True,
+                restore_args=restore_args_tree,
             ),
         ),
     )["model_state"]
@@ -1911,6 +1983,19 @@ def restore_dreamer4_tokenizer(
     
     return tokenizer
 
+def _create_abstract_sharded_pytree(
+    pytree_template: nnx.GraphState, sharding_spec: jax.sharding.NamedSharding
+) -> jax.Array:
+    """Replaces arrays in a pytree with ShapeDtypeStructs having the given sharding."""
+
+    def map_fn(leaf_template):
+        if hasattr(leaf_template, "shape") and hasattr(leaf_template, "dtype"):
+            return jax.ShapeDtypeStruct(
+                leaf_template.shape, leaf_template.dtype, sharding=sharding_spec
+            )
+        return leaf_template
+
+    return jax.tree_util.tree_map(map_fn, pytree_template)
 
 
 

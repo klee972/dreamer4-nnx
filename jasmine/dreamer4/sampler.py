@@ -99,6 +99,13 @@ def _validate_modes(cfg: SamplerConfig):
         raise ValueError("schedule='shortcut' requires a valid d (e.g., 1/4).")
 
 def _tau_grid_from(k_max: int, schedule: Schedule, d_opt: Optional[float], start_tau: float) -> Tuple[jnp.ndarray, int, float, int]:
+    """
+    if start_tau is 2/4 and d_opt = 1/4, 
+    tau_seq = [2/4, 3/4, 4/4]
+    S = 2 (len(tau_seq)-1)
+    d = 1/4
+    e = 2 (log2(1/d))
+    """
     d = _choose_step_size(k_max, schedule, d_opt)
     # Use numpy for S computation to keep it concrete (not traced by JAX)
     start_aligned = float(np.clip(np.floor(start_tau / d) * d, 0.0, 1.0))
@@ -106,7 +113,7 @@ def _tau_grid_from(k_max: int, schedule: Schedule, d_opt: Optional[float], start
     S = int(round(S_float))  # Python int, not traced
     tau_seq = start_aligned + d * np.arange(S + 1, dtype=np.float32)
     tau_seq = np.clip(tau_seq, 0.0, 1.0)
-    e = _step_idx_from_d(float(d), k_max)
+    e = _step_idx_from_d(float(d), k_max) # e = log2(1/d)
     return tau_seq, S, float(d), e
 
 
@@ -175,7 +182,7 @@ def denoise_single_latent(
     z_ctx_clean: jnp.ndarray,     # (B, T_ctx, n_spatial, D_s) clean context
     z_t_init: jnp.ndarray,        # (B, 1, n_spatial, D_s) initial latent at tau0
     k_max: int,
-    d: float,
+    d: float, # step size (1/4 if denoise 4 times per sample)
     start_mode: StartMode,
     tau0_fixed: float,
     rng_key: jax.Array,
@@ -195,8 +202,9 @@ def denoise_single_latent(
     """
     B, T_ctx, n_spatial, D_s = z_ctx_clean.shape
     _assert_power_of_two(k_max)
-    assert actions_ctx.shape == (B, T_ctx)
-    assert action_curr.shape == (B, 1)
+    # Accept both flat (B, T) and hierarchical (B, T, 2) action shapes
+    assert actions_ctx.shape[:2] == (B, T_ctx), f"Expected actions_ctx leading dims ({B}, {T_ctx}), got {actions_ctx.shape}"
+    assert action_curr.shape[:2] == (B, 1), f"Expected action_curr leading dims ({B}, 1), got {action_curr.shape}"
 
     # 1) choose tau0
     rng_key, r_tau, r_noise, r_ctx = jax.random.split(rng_key, 4)
@@ -226,7 +234,7 @@ def denoise_single_latent(
     for s in range(1, len(tau_seq_host)):
         tau_prev = float(tau_seq_host[s - 1])
         tau_curr = float(tau_seq_host[s])
-        # Correct per-step mixing toward clean:
+        # per-step mixing ratio toward clean:
         alpha = (tau_curr - tau_prev) / max(1.0 - tau_prev, 1e-8)
 
         # Context at current τ (if requested)
@@ -239,7 +247,14 @@ def denoise_single_latent(
         z_seq = jnp.concatenate([z_ctx_tau, z_t], axis=1)                   # (B, T_ctx+1, n_spatial, D_s)
         actions_full = jnp.concatenate([actions_ctx, action_curr], axis=1)  # (B, T_ctx+1)
         step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
-        signal_idx = jnp.full((B, T_ctx + 1), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
+        # Context signal_idx: if match_ctx_tau, context is corrupted to tau_curr; otherwise it's clean (k_max-1)
+        # Future signal_idx: z_t is at tau_prev (the level BEFORE this denoising step), not tau_curr
+        if match_ctx_tau:
+            signal_idx_ctx = jnp.full((B, T_ctx), _signal_idx_from_tau(jnp.asarray(tau_curr), k_max), dtype=jnp.int32)
+        else:
+            signal_idx_ctx = jnp.full((B, T_ctx), k_max - 1, dtype=jnp.int32)
+        signal_idx_future = jnp.full((B, 1), _signal_idx_from_tau(jnp.asarray(tau_prev), k_max), dtype=jnp.int32)
+        signal_idx = jnp.concatenate([signal_idx_ctx, signal_idx_future], axis=1)
 
         # Predict clean for the current frame
         z_clean_pred_seq, h_seq = dynamics(

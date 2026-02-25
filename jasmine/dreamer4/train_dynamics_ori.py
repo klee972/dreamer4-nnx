@@ -45,6 +45,7 @@ from jasmine.dreamer4.sampler import sample_video, SamplerConfig
 from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_to_spatial, unpack_spatial_to_bottleneck
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -101,8 +102,6 @@ class Args:
     dyna_n_head: int = 16
     dyna_k_max: int = 8
     batch_size_self: int = batch_size // 2
-    seq_len_short: int = 16       # short branch T; ignored when seq_len_ratio == 0.0
-    seq_len_ratio: float = 0.75    # fraction of batch assigned to short branch (0.0 = disabled)
     # Logging
     log: bool = True
     entity: str = "4bkang"
@@ -119,8 +118,6 @@ class Args:
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
-
-
 
 
 def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, DynamicsDreamer4]:
@@ -241,33 +238,6 @@ def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
         num_workers=8,
         prefetch_buffer_size=8,
         seed=args.seed,
-        load_actions=True,
-        action_mapper=action_mapper,
-        action_format="hierarchical",
-    )
-    initial_state = grain_dataloader._create_initial_state()
-    grain_iterator = grain.DataLoaderIterator(grain_dataloader, initial_state)
-    return grain_iterator
-
-
-def build_dataloader_with_seq_len(
-    args: Args, data_dir: str, seq_len: int, batch_size: int, seed: int | None = None
-) -> grain.DataLoaderIterator:
-    """Like build_dataloader but with explicit seq_len and batch_size overrides."""
-    image_shape = (args.image_height, args.image_width, args.image_channels)
-    action_mapper = CameraHierarchicalActionMapping(
-        n_camera_bins=args.n_camera_bins,
-        camera_maxval=args.camera_maxval,
-        camera_binsize=args.camera_binsize,
-    )
-    grain_dataloader = get_video_dataloader(
-        data_dir,
-        seq_len,
-        batch_size,
-        *image_shape,
-        num_workers=8,
-        prefetch_buffer_size=8,
-        seed=seed if seed is not None else args.seed,
         load_actions=True,
         action_mapper=action_mapper,
         action_format="hierarchical",
@@ -449,149 +419,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
 
 
 
-
-@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
-def _sample_tau_for_step(rng, shape_bt, k_max: int, step_idx: jnp.ndarray, *, dtype=jnp.float32):
-    B_, T_ = shape_bt
-    K = (1 << step_idx)
-    u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
-    j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
-    tau = j_idx.astype(dtype) / K.astype(dtype)
-    tau_idx = j_idx * (k_max // K)
-    return tau, tau_idx
-
-
-@partial(jax.jit, static_argnames=("shape_bt", "k_max", "dtype"))
-def _sample_step_excluding_dmin(rng, shape_bt, k_max: int, *, dtype=jnp.float32):
-    B_, T_ = shape_bt
-    emax = jnp.log2(k_max).astype(jnp.int32)
-    step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)
-    d = 1.0 / (1 << step_idx).astype(dtype)
-    return d, step_idx
-
-
-def _compute_branch_inputs(
-    tokenizer: "TokenizerDreamer4",
-    inputs: dict,
-    B: int,
-    T: int,
-    B_self: int,
-    key_sigma: jnp.ndarray,
-    key_step_self: jnp.ndarray,
-    key_noise: jnp.ndarray,
-    k_max: int,
-    dtype,
-    n_spatial: int,
-    packing_factor: int,
-) -> dict:
-    """Compute all non-differentiable inputs for one training branch.
-
-    Called inside a JIT-compiled function; B, T, B_self are concrete Python ints
-    (from static_argnames of the outer jit).
-    """
-    B_emp = B - B_self
-    emax = jnp.log2(k_max).astype(jnp.int32)
-
-    gt = jnp.asarray(inputs["videos"], dtype=jnp.float32) / 255.0
-    latent_tokens = tokenizer.mask_and_encode(gt.astype(dtype), rng=None, training=False)["z"]
-    z1 = pack_bottleneck_to_spatial(latent_tokens, n_spatial=n_spatial, k=packing_factor)
-
-    step_idx_emp = jnp.full((B_emp, T), emax, dtype=jnp.int32)
-    d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), k_max, dtype=dtype)
-    step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)  # (B, T)
-
-    sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma, (B, T), k_max, step_idx_full, dtype=dtype)
-    sigma_emp = sigma_full[:B_emp]
-    sigma_self = sigma_full[B_emp:]
-    sigma_idx_self_arr = sigma_idx_full[B_emp:]
-
-    z0_full = jax.random.normal(key_noise, z1.shape, dtype=z1.dtype)
-    z_tilde_full = (1.0 - sigma_full)[..., None, None] * z0_full + sigma_full[..., None, None] * z1
-    z_tilde_self = z_tilde_full[B_emp:]
-
-    w_emp = 0.9 * sigma_emp + 0.1
-    w_self = 0.9 * sigma_self + 0.1
-
-    d_half = d_self / 2.0
-    step_idx_half = step_idx_self + 1
-    sigma_plus = sigma_self + d_half
-    sigma_idx_plus = sigma_idx_self_arr + (k_max * d_half).astype(jnp.int32)
-
-    return dict(
-        z1=z1,
-        actions=inputs["actions"],
-        B_emp=B_emp,
-        step_idx_full=step_idx_full,
-        sigma_idx_full=sigma_idx_full,
-        z_tilde_full=z_tilde_full,
-        z_tilde_self=z_tilde_self,
-        w_emp=w_emp,
-        w_self=w_self,
-        sigma_self=sigma_self,
-        sigma_idx_self=sigma_idx_self_arr,
-        d_half=d_half,
-        step_idx_half=step_idx_half,
-        sigma_plus=sigma_plus,
-        sigma_idx_plus=sigma_idx_plus,
-    )
-
-
-def _make_branch_loss_fn(branch: dict, B: int, B_self: int, bootstrap_start, step):
-    """Return a loss_and_aux closure over precomputed branch inputs.
-
-    The returned closure takes `dynamics` and returns (loss, (z1_hat_full, metrics)).
-    """
-    z1 = branch["z1"]
-    actions_full = branch["actions"]
-    B_emp = branch["B_emp"]
-    step_idx_full = branch["step_idx_full"]
-    sigma_idx_full = branch["sigma_idx_full"]
-    z_tilde_full = branch["z_tilde_full"]
-    z_tilde_self = branch["z_tilde_self"]
-    w_emp = branch["w_emp"]
-    w_self = branch["w_self"]
-    sigma_self = branch["sigma_self"]
-    sigma_idx_self = branch["sigma_idx_self"]
-    d_half = branch["d_half"]
-    step_idx_half = branch["step_idx_half"]
-    sigma_plus = branch["sigma_plus"]
-    sigma_idx_plus = branch["sigma_idx_plus"]
-
-    def loss_and_aux(dynamics: "DynamicsDreamer4"):
-        z1_hat_full, _ = dynamics(actions_full, step_idx_full, sigma_idx_full, z_tilde_full)
-        z1_hat_emp = z1_hat_full[:B_emp]
-        z1_hat_self = z1_hat_full[B_emp:]
-
-        flow_per = jnp.mean((z1_hat_emp - z1[:B_emp]) ** 2, axis=(2, 3))  # (B_emp, T)
-        loss_emp = jnp.mean(flow_per * w_emp)
-
-        do_boot = (B_self > 0) & (step >= bootstrap_start)
-
-        z1_hat_half1, _ = dynamics(actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self)
-        b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
-        z_prime = z_tilde_self + b_prime * d_half[..., None, None]
-        z1_hat_half2, _ = dynamics(actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime)
-        b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[..., None, None]
-        vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[..., None, None]
-        vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
-        boot_per = (1.0 - sigma_self) ** 2 * jnp.mean((vhat_sigma - vbar_target) ** 2, axis=(2, 3))
-        boot_loss_raw = jnp.mean(boot_per * w_self)
-        boot_mse_raw = jnp.mean(boot_per)
-
-        zero = jnp.array(0.0, dtype=z1.dtype)
-        loss_self = jnp.where(do_boot, boot_loss_raw, zero)
-        boot_mse = jnp.where(do_boot, boot_mse_raw, zero)
-
-        loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
-        metrics = {
-            "flow_mse": jnp.mean(flow_per),
-            "bootstrap_mse": boot_mse,
-        }
-        return loss, (z1_hat_full, metrics)
-
-    return loss_and_aux
-
-
 def main(args: Args) -> None:
     # jax.distributed.initialize()
     num_devices = jax.device_count()
@@ -651,35 +478,8 @@ def main(args: Args) -> None:
     # --- Initialize checkpoint manager ---
     checkpoint_manager = build_checkpoint_manager(args)
 
-    # --- Derived batch sizes for mixed seq-len mode ---
-    short_iterator = None
-    if args.seq_len_ratio > 0.0:
-        B_long = int(args.batch_size * (1.0 - args.seq_len_ratio))
-        B_short = args.batch_size - B_long
-        B_self_long = int(args.batch_size_self * (1.0 - args.seq_len_ratio))
-        B_self_short = args.batch_size_self - B_self_long
-        T_short = args.seq_len_short
-        T_long = args.seq_len
-        assert B_short % num_devices == 0, (
-            f"B_short={B_short} must be divisible by num_devices={num_devices}. "
-            f"Adjust batch_size or seq_len_ratio."
-        )
-        assert B_long % num_devices == 0, (
-            f"B_long={B_long} must be divisible by num_devices={num_devices}. "
-            f"Adjust batch_size or seq_len_ratio."
-        )
-
     # --- Create DataLoaderIterator from dataloader ---
-    if args.seq_len_ratio > 0.0:
-        train_iterator = build_dataloader_with_seq_len(
-            args, args.data_dir, seq_len=T_long, batch_size=B_long
-        )
-        short_iterator = build_dataloader_with_seq_len(
-            args, args.data_dir, seq_len=T_short, batch_size=B_short,
-            seed=args.seed + 1,  # independent episode sampling
-        )
-    else:
-        train_iterator = build_dataloader(args, args.data_dir)
+    train_iterator = build_dataloader(args, args.data_dir)
     val_iterator = None
     if args.val_data_dir:
         val_iterator = build_dataloader(args, args.val_data_dir)
@@ -702,7 +502,7 @@ def main(args: Args) -> None:
     @partial(nnx.jit, donate_argnums=0, static_argnames=("B", "T", "B_self"))
     def train_step(
         optimizer: nnx.ModelAndOptimizer, tokenizer: TokenizerDreamer4, inputs: dict,
-        B: int, T: int, B_self: int,
+        B: int, T: int, B_self: int, 
         master_key: jnp.ndarray, step: int, bootstrap_start: int,
     ) -> tuple[jax.Array, jax.Array, dict]:
         """
@@ -712,79 +512,118 @@ def main(args: Args) -> None:
         If step < bootstrap_start, the bootstrap contribution is masked to 0 (but we still
         execute one fused path to keep a single jit and stable shapes).
         """
+        @partial(jax.jit, static_argnames=("shape_bt","k_max","dtype"))
+        def _sample_tau_for_step(rng, shape_bt, k_max:int, step_idx:jnp.ndarray, *, dtype=jnp.float32):
+            B_, T_ = shape_bt
+            K = (1 << step_idx)
+            u = jax.random.uniform(rng, (B_, T_), dtype=dtype)
+            j_idx = jnp.floor(u * K.astype(dtype)).astype(jnp.int32)
+            tau = j_idx.astype(dtype) / K.astype(dtype)
+            tau_idx = j_idx * (k_max // K)
+            return tau, tau_idx
+
+        @partial(jax.jit, static_argnames=("shape_bt","k_max","dtype"))
+        def _sample_step_excluding_dmin(rng, shape_bt, k_max:int, *, dtype=jnp.float32):
+            B_, T_ = shape_bt
+            emax = jnp.log2(k_max).astype(jnp.int32)
+            step_idx = jax.random.randint(rng, (B_, T_), 0, emax, dtype=jnp.int32)  # exclude emax
+            d = 1.0 / (1 << step_idx).astype(dtype)
+            return d, step_idx
         step_key = jax.random.fold_in(master_key, step)
-        _, key_sigma, key_step_self, key_noise, _ = jax.random.split(step_key, 5)
+        enc_key, key_sigma_full, key_step_self, key_noise_full, drop_key = jax.random.split(step_key, 5)
 
-        branch = _compute_branch_inputs(
-            tokenizer, inputs, B, T, B_self,
-            key_sigma, key_step_self, key_noise,
-            args.dyna_k_max, args.dtype, args.dyna_n_spatial, args.dyna_packing_factor,
-        )
-        loss_fn = _make_branch_loss_fn(branch, B, B_self, bootstrap_start, step)
+        dynamics = optimizer.model
+        actions = inputs["actions"]
+        gt = jnp.asarray(inputs["videos"], dtype=jnp.float32) / 255.0
 
-        (loss, (z1_hat, metrics)), grads = nnx.value_and_grad(loss_fn, has_aux=True)(
+        latent_tokens_BTNlL = tokenizer.mask_and_encode(gt.astype(args.dtype), rng=None, training=False)['z'] # we can pass None to rng because we are not training the tokenizer
+        z1 = pack_bottleneck_to_spatial(latent_tokens_BTNlL, n_spatial=args.dyna_n_spatial, k=args.dyna_packing_factor)
+
+        # Deterministic batch split
+        B_emp  = B - B_self
+        actions_full = actions
+        emax = jnp.log2(args.dyna_k_max).astype(jnp.int32)
+
+        # --- Step indices (encode d) ---
+        step_idx_emp  = jnp.full((B_emp,  T), emax, dtype=jnp.int32)             # d = d_min
+        # If B_self == 0, create a dummy 0xT array – slicing below handles it.
+        d_self, step_idx_self = _sample_step_excluding_dmin(key_step_self, (B_self, T), args.dyna_k_max, dtype=args.dtype)
+        # d_self: d (step size in shortcut model). step_idx_self: log2(1/d_self)
+        step_idx_full = jnp.concatenate([step_idx_emp, step_idx_self], axis=0)   # (B,T)
+
+        # --- Signal levels on each row's grid (one call for whole batch) ---
+        sigma_full, sigma_idx_full = _sample_tau_for_step(key_sigma_full, (B, T), args.dyna_k_max, step_idx_full, dtype=args.dtype)
+        # sigma here is tau in dreamer 4 paper.  sigma_full: timestep in [0, 1]. sigma_idx_full: sigma_full * k_max as integer.
+        sigma_emp   = sigma_full[:B_emp]
+        sigma_self  = sigma_full[B_emp:]
+        sigma_idx_self = sigma_idx_full[B_emp:]
+
+        # --- Corrupt inputs: z_tilde = (1 - sigma) z0 + sigma z1 ---
+        z0_full      = jax.random.normal(key_noise_full, z1.shape, dtype=z1.dtype)
+        z_tilde_full = (1.0 - sigma_full)[...,None,None] * z0_full + sigma_full[...,None,None] * z1
+        z_tilde_self = z_tilde_full[B_emp:]
+
+        # --- Ramp weights ---
+        w_emp  = 0.9 * sigma_emp  + 0.1
+        w_self = 0.9 * sigma_self + 0.1
+
+        # --- Half-step metadata for self rows ---
+        d_half            = d_self / 2.0
+        step_idx_half     = step_idx_self + 1
+        sigma_plus        = sigma_self + d_half
+        sigma_idx_plus    = sigma_idx_self + (args.dyna_k_max * d_half).astype(jnp.int32)
+
+        def loss_and_aux(dynamics: DynamicsDreamer4):
+            # Main forward (emp + self)
+            z1_hat_full, _ = dynamics(
+                actions_full, step_idx_full, sigma_idx_full, z_tilde_full,
+            )  # (B,T,n_spatial,d_model)
+
+            z1_hat_emp  = z1_hat_full[:B_emp]
+            z1_hat_self = z1_hat_full[B_emp:]
+
+            # Flow loss on empirical rows (to z1)
+            flow_per = jnp.mean((z1_hat_emp - z1[:B_emp])**2, axis=(2,3))        # (B_emp,T)
+            loss_emp = jnp.mean(flow_per * w_emp)
+
+            # Self-consistency (bootstrap) on self rows
+            # Always compute bootstrap loss but mask it when B_self == 0 or step < bootstrap_start
+            # We avoid jax.lax.cond because calling dynamics (NNX model) inside cond causes tracer leaks
+            do_boot = (B_self > 0) & (step >= bootstrap_start)
+
+            # Compute bootstrap loss (will be masked to 0 if do_boot is False)
+            z1_hat_half1, _ = dynamics(
+                actions_full[B_emp:], step_idx_half, sigma_idx_self, z_tilde_self,
+            )
+            b_prime = (z1_hat_half1 - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            z_prime = z_tilde_self + b_prime * d_half[...,None,None]
+            z1_hat_half2, _ = dynamics(
+                actions_full[B_emp:], step_idx_half, sigma_idx_plus, z_prime,
+            )
+            b_doubleprime = (z1_hat_half2 - z_prime) / (1.0 - sigma_plus)[...,None,None]
+            vhat_sigma = (z1_hat_self - z_tilde_self) / (1.0 - sigma_self)[...,None,None]
+            vbar_target = jax.lax.stop_gradient((b_prime + b_doubleprime) / 2.0)
+            boot_per = (1.0 - sigma_self)**2 * jnp.mean((vhat_sigma - vbar_target)**2, axis=(2,3))  # (B_self,T)
+            boot_loss_raw = jnp.mean(boot_per * w_self)
+            boot_mse_raw = jnp.mean(boot_per)
+
+            # Mask bootstrap loss when not active
+            zero = jnp.array(0.0, dtype=z1.dtype)
+            loss_self = jnp.where(do_boot, boot_loss_raw, zero)
+            boot_mse = jnp.where(do_boot, boot_mse_raw, zero)
+
+            # Combine (row-weighted by nominal B parts; denominator B keeps scale constant)
+            loss = ((loss_emp * (B - B_self)) + (loss_self * B_self)) / B
+            metrics = {
+                "flow_mse": jnp.mean(flow_per),
+                "bootstrap_mse": boot_mse,
+            }
+            return loss, (z1_hat_full, metrics)
+
+
+        (loss, (z1_hat, metrics)), grads = nnx.value_and_grad(loss_and_aux, has_aux=True)(
             optimizer.model
         )
-        optimizer.update(grads)
-        if args.log_gradients:
-            metrics["gradients_std/"] = jax.tree.map(
-                lambda x: x.std(), grads["params"]["dynamics"]
-            )
-        return loss, z1_hat, metrics
-
-    @partial(nnx.jit, donate_argnums=0,
-             static_argnames=("B_s", "T_s", "B_self_s", "B_l", "T_l", "B_self_l"))
-    def train_step_mixed(
-        optimizer: nnx.ModelAndOptimizer,
-        tokenizer: TokenizerDreamer4,
-        batch_short: dict,
-        batch_long: dict,
-        B_s: int, T_s: int, B_self_s: int,
-        B_l: int, T_l: int, B_self_l: int,
-        master_key: jnp.ndarray,
-        step: int,
-        bootstrap_start: int,
-    ) -> tuple[jax.Array, jax.Array, dict]:
-        """Mixed sequence-length training step.
-
-        Two branches (short T_s, long T_l) each compute a weighted branch loss.
-        Both contribute to a SINGLE gradient update via one nnx.value_and_grad call,
-        yielding ~40-47% speedup vs. training with T_l alone.
-
-        Returns: (combined_loss, z1_hat_long, merged_metrics)
-        """
-        step_key = jax.random.fold_in(master_key, step)
-        keys = jax.random.split(step_key, 8)
-
-        branch_s = _compute_branch_inputs(
-            tokenizer, batch_short, B_s, T_s, B_self_s,
-            keys[0], keys[1], keys[2],
-            args.dyna_k_max, args.dtype, args.dyna_n_spatial, args.dyna_packing_factor,
-        )
-        branch_l = _compute_branch_inputs(
-            tokenizer, batch_long, B_l, T_l, B_self_l,
-            keys[4], keys[5], keys[6],
-            args.dyna_k_max, args.dtype, args.dyna_n_spatial, args.dyna_packing_factor,
-        )
-        loss_fn_s = _make_branch_loss_fn(branch_s, B_s, B_self_s, bootstrap_start, step)
-        loss_fn_l = _make_branch_loss_fn(branch_l, B_l, B_self_l, bootstrap_start, step)
-
-        B_total = B_s + B_l
-
-        def loss_and_aux_mixed(dynamics: DynamicsDreamer4):
-            loss_s, (_, metrics_s) = loss_fn_s(dynamics)
-            loss_l, (z1_hat_l, metrics_l) = loss_fn_l(dynamics)
-            combined = (loss_s * B_s + loss_l * B_l) / B_total
-            merged_metrics = {
-                "short/flow_mse": metrics_s["flow_mse"],
-                "short/bootstrap_mse": metrics_s["bootstrap_mse"],
-                **metrics_l,
-            }
-            return combined, (z1_hat_l, merged_metrics)
-
-        (loss, (z1_hat, metrics)), grads = nnx.value_and_grad(
-            loss_and_aux_mixed, has_aux=True
-        )(optimizer.model)
         optimizer.update(grads)
         if args.log_gradients:
             metrics["gradients_std/"] = jax.tree.map(
@@ -838,7 +677,7 @@ def main(args: Args) -> None:
             val_videos: dict with keys like "{tag}_recon", "{tag}_gt", "{tag}_floor"
         """
         # Get tags from regimes
-        ctx_length = min(args.seq_len // 2, args.seq_len - 1)
+        ctx_length = min(32, args.seq_len - 1)
         regimes = _eval_regimes_for_realism(args, ctx_length=ctx_length)
         tags = [tag for tag, _ in regimes]
         
@@ -892,8 +731,8 @@ def main(args: Args) -> None:
         return np.pad(stacked, ((0, 0), (0, 1), (0, 0)))            # (B, T,   2)
 
     # --- TRAIN LOOP ---
-    def _make_sharded_batch(elem):
-        return {
+    dataloader_train = (
+        {
             "videos": jax.make_array_from_process_local_data(
                 videos_sharding, local_data=elem["videos"]
             ),
@@ -901,69 +740,44 @@ def main(args: Args) -> None:
                 actions_sharding, _stack_actions(elem["actions"])
             ),
         }
-
-    dataloader_train = (_make_sharded_batch(elem) for elem in train_iterator)
-    dataloader_short = None
-    if short_iterator is not None:
-        dataloader_short = (_make_sharded_batch(elem) for elem in short_iterator)
-
+        for elem in train_iterator
+    )
     dataloader_val = None
     if val_iterator:
-        dataloader_val = (_make_sharded_batch(elem) for elem in val_iterator)
-
+        dataloader_val = (
+            {
+                "videos": jax.make_array_from_process_local_data(
+                    videos_sharding, elem["videos"]
+                ),
+                "actions": jax.make_array_from_process_local_data(
+                    actions_sharding, _stack_actions(elem["actions"])
+                ),
+            }
+            for elem in val_iterator
+        )
     if jax.process_index() == 0:
-        if args.seq_len_ratio > 0.0:
-            first_batch_long = next(dataloader_train)
-            first_batch_short = next(dataloader_short)
-            first_batch_long["rng"] = rng  # type: ignore
-            first_batch_short["rng"] = rng  # type: ignore
-            compiled = train_step_mixed.lower(
-                optimizer, tokenizer, first_batch_short, first_batch_long,
-                B_s=B_short, T_s=T_short, B_self_s=B_self_short,
-                B_l=B_long, T_l=T_long, B_self_l=B_self_long,
-                master_key=rng, step=0, bootstrap_start=args.bootstrap_start,
-            ).compile()
-            print_compiled_memory_stats(compiled.memory_analysis())
-            print_compiled_cost_analysis(compiled.cost_analysis())
-            dataloader_train = itertools.chain([first_batch_long], dataloader_train)
-            dataloader_short = itertools.chain([first_batch_short], dataloader_short)
-        else:
-            first_batch = next(dataloader_train)
-            first_batch["rng"] = rng  # type: ignore
-            compiled = train_step.lower(
-                optimizer, tokenizer, first_batch,
-                B=args.batch_size, T=args.seq_len, B_self=args.batch_size_self,
-                master_key=rng, step=0, bootstrap_start=args.bootstrap_start,
-            ).compile()
-            print_compiled_memory_stats(compiled.memory_analysis())
-            print_compiled_cost_analysis(compiled.cost_analysis())
-            dataloader_train = itertools.chain([first_batch], dataloader_train)
-
+        first_batch = next(dataloader_train)
+        first_batch["rng"] = rng  # type: ignore
+        compiled = train_step.lower(
+            optimizer, tokenizer, first_batch,
+            B=args.batch_size, T=args.seq_len, B_self=args.batch_size_self,
+            master_key=rng, step=0, bootstrap_start=args.bootstrap_start).compile()
+        print_compiled_memory_stats(compiled.memory_analysis())
+        print_compiled_cost_analysis(compiled.cost_analysis())
+        # Do not skip the first batch during training
+        dataloader_train = itertools.chain([first_batch], dataloader_train)
     print(f"Starting training from step {step}...")
     first_step = step
     while step < args.num_steps:
-        for batch_long in dataloader_train:
+        for batch in dataloader_train:
             # --- Train step ---
             rng, _rng_mask = jax.random.split(rng, 2)
-            if args.seq_len_ratio > 0.0:
-                batch_short = next(dataloader_short)
-                batch_short["rng"] = _rng_mask
-                batch_long["rng"] = _rng_mask
-                loss, z1_hat, metrics = train_step_mixed(
-                    optimizer, tokenizer, batch_short, batch_long,
-                    B_s=B_short, T_s=T_short, B_self_s=B_self_short,
-                    B_l=B_long, T_l=T_long, B_self_l=B_self_long,
-                    master_key=rng, step=step, bootstrap_start=args.bootstrap_start,
-                )
-                batch = batch_long  # use long branch for visualization
-            else:
-                batch_long["rng"] = _rng_mask
-                loss, z1_hat, metrics = train_step(
-                    optimizer, tokenizer, batch_long,
-                    B=args.batch_size, T=args.seq_len, B_self=args.batch_size_self,
-                    master_key=rng, step=step, bootstrap_start=args.bootstrap_start,
-                )
-                batch = batch_long
+            batch["rng"] = _rng_mask
+            loss, z1_hat, metrics = train_step(
+                optimizer, tokenizer, batch,
+                B=args.batch_size, T=args.seq_len, B_self=args.batch_size_self,
+                master_key=rng, step=step, bootstrap_start=args.bootstrap_start
+            )
             z1_hat = einops.rearrange(
                 z1_hat, 
                 'b t n_spatial (packing_factor d_latent) -> b t (n_spatial packing_factor) d_latent', 

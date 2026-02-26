@@ -1,4 +1,4 @@
-# Jasmine
+# Dreamer4-NNX
 
 A JAX + flax NNX-based implementation of the Dreamer4 world model. Trains a tokenizer and dynamics model using the OpenAI Video-Pre-Training (VPT) Minecraft dataset.
 

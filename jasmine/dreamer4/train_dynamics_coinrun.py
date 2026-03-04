@@ -49,7 +49,6 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_t
 
 
 
-
 @dataclass
 class Args:
     # Experiment
@@ -74,6 +73,7 @@ class Args:
     warmup_steps: int = 5000
     lr_schedule: str = "wsd"  # supported options: wsd, cos
     bootstrap_start: int = 5_000  # shotcut distillation start step
+    optimizer: str = "muon"  # supported options: adamw, muon
     # Common
     time_every: int = 4
     mlp_ratio: int = 4
@@ -104,16 +104,16 @@ class Args:
     dyna_n_head: int = 12
     dyna_k_max: int = 128
     batch_size_self: int = batch_size // 2
-    ctx_length: int = 1  # num. gt frames given when validating
+    ctx_length: int = 8  # num. gt frames given when validating
     # Logging
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "dynamics_dreamer4_coinrun"
+    name: str = "dynamics_dreamer4_coinrun_muon"
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/dynamics_ctx1"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/coinrun/dreamer4/dynamics_muon"
     log_checkpoint_interval: int = 5000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
@@ -122,7 +122,6 @@ class Args:
     val_steps: int = 10
     wandb_id: str = ""
     
-
 
 
 def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, DynamicsDreamer4]:
@@ -183,13 +182,27 @@ def build_optimizer(dynamics: DynamicsDreamer4, args: Args) -> nnx.ModelAndOptim
         args.warmup_steps,
         args.wsd_decay_steps,
     )
-    tx = optax.adamw(
-        learning_rate=lr_schedule,
-        b1=0.9,
-        b2=0.9,
-        weight_decay=1e-4,
-        mu_dtype=args.param_dtype,  # moments in full precision
-    )
+    if args.optimizer == "adamw":
+        tx = optax.adamw(
+            learning_rate=lr_schedule,
+            b1=0.9,
+            b2=0.9,
+            weight_decay=1e-4,
+            mu_dtype=args.param_dtype,
+        )
+    elif args.optimizer == "muon":
+        muon_tx = optax.contrib.muon(learning_rate=lr_schedule, mu_dtype=args.param_dtype)
+        # Wrap init to strip NNX Variables before calling muon's init.
+        # muon uses combine.partition which creates Param(MaskedNode) when
+        # params contain Variables, causing to_opt_state to fail.
+        # Optimizer.update already strips Variables via nnx.to_arrays(nnx.pure(...)),
+        # so we only need to fix init.
+        original_init = muon_tx.init
+        def _compat_init(params):
+            return original_init(nnx.to_arrays(nnx.pure(params)))
+        tx = optax.GradientTransformation(_compat_init, muon_tx.update)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}. Supported: adamw, muon")
     optimizer = nnx.ModelAndOptimizer(dynamics, tx)
     return optimizer
 
@@ -356,7 +369,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         dyna_k_max=cfg.dyna_k_max,
         horizon=cfg.seq_len - cfg.ctx_length,
         ctx_length=ctx_length,
-        ctx_signal_tau=1.0,
         image_height=cfg.image_height, image_width=cfg.image_width, image_channels=cfg.image_channels, patch_size=cfg.patch_size,
         dyna_n_spatial=cfg.dyna_n_spatial,
         dyna_packing_factor=cfg.dyna_packing_factor,

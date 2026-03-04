@@ -479,7 +479,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         k_max=cfg.k_max,
         horizon=min(32, cfg.T - ctx_length),
         ctx_length=ctx_length,
-        ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         H=cfg.H, W=cfg.W, C=cfg.C, patch=cfg.patch,
         n_spatial=cfg.enc_n_latents // cfg.packing_factor,
         packing_factor=cfg.packing_factor,

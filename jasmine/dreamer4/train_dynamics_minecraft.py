@@ -46,6 +46,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_t
 
 
 
+
 @dataclass
 class Args:
     # Experiment
@@ -89,6 +90,7 @@ class Args:
     tokenizer_d_model: int = 768
     tokenizer_n_block: int = 12
     tokenizer_n_head: int = 12
+    tokenizer_time_every: int = 4
     tokenizer_checkpoint: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 1536
@@ -103,7 +105,7 @@ class Args:
     batch_size_self: int = batch_size // 2
     seq_len_short: int = 16       # short branch T; ignored when seq_len_ratio == 0.0
     seq_len_ratio: float = 0.75    # fraction of batch assigned to short branch (0.0 = disabled)
-    ctx_length: int = 1  # num. gt frames given when validating
+    ctx_length: int = 8  # num. gt frames given when validating
     # Logging
     log: bool = True
     entity: str = "4bkang"
@@ -120,7 +122,6 @@ class Args:
     val_interval: int = 10_000
     val_steps: int = 5
     wandb_id: str = ""
-
 
 
 
@@ -429,7 +430,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         dyna_k_max=cfg.dyna_k_max,
         horizon=cfg.seq_len - cfg.ctx_length,
         ctx_length=ctx_length,
-        ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         image_height=cfg.image_height, image_width=cfg.image_width, image_channels=cfg.image_channels, patch_size=cfg.patch_size,
         dyna_n_spatial=cfg.dyna_n_spatial,
         dyna_packing_factor=cfg.dyna_packing_factor,

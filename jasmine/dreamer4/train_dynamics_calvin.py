@@ -59,8 +59,8 @@ class Args:
     image_width: int = 200
     data_dir: str = "/home/4bkang/rl/calvin/dataset/task_ABCD_D/training"
     save_ckpt: bool = True
-    restore_ckpt: bool = False
-    restore_step: int = 5000
+    restore_ckpt: bool = True
+    restore_step: int = 0
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -124,7 +124,7 @@ class Args:
     val_data_dir: str = "/home/4bkang/rl/calvin/dataset/task_ABCD_D/validation"
     val_interval: int = 10_000
     val_steps: int = 5
-    wandb_id: str = ""
+    wandb_id: str = "zl8aepyc"
 
 
 
@@ -424,7 +424,6 @@ def _eval_regimes_for_realism(cfg, *, ctx_length: int):
         dyna_k_max=cfg.dyna_k_max,
         horizon=cfg.seq_len - cfg.ctx_length,
         ctx_length=ctx_length,
-        ctx_signal_tau=1.0,   # was 0.99 — make context clean for fair PSNR
         image_height=cfg.image_height, image_width=cfg.image_width, image_channels=cfg.image_channels, patch_size=cfg.patch_size,
         dyna_n_spatial=cfg.dyna_n_spatial,
         dyna_packing_factor=cfg.dyna_packing_factor,

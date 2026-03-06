@@ -134,7 +134,7 @@ uv run python data/jasmine_data/split_dataset.py \
 Train the Dreamer4 tokenizer on the chunked video data.
 
 ```bash
-bash run_tok.sh
+bash run_tok_{dataset_name}.sh
 ```
 
 Internally runs `jasmine/dreamer4/train_tokenizer.py`.
@@ -144,7 +144,7 @@ Internally runs `jasmine/dreamer4/train_tokenizer.py`.
 Train the world model dynamics on top of the learned tokenizer.
 
 ```bash
-bash run_dyna.sh
+bash run_dyna_{dataset_name}.sh
 ```
 
 Internally runs `jasmine/dreamer4/train_dynamics.py`.

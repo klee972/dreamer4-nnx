@@ -277,7 +277,8 @@ def denoise_single_latent(
             # frame t gets a_{t-1}, future frame T_ctx gets a_{T_ctx-1}.
             # Context is fed at ctx_noise_tau level (precomputed as z_ctx_for_full).
             z_seq = jnp.concatenate([z_ctx_for_full, z_t], axis=1)
-            sentinel = jnp.full((B, 1) + actions_ctx.shape[2:], -1, dtype=actions_ctx.dtype)
+            _sent_val = float('nan') if jnp.issubdtype(actions_ctx.dtype, jnp.floating) else -1
+            sentinel = jnp.full((B, 1) + actions_ctx.shape[2:], _sent_val, dtype=actions_ctx.dtype)
             actions_full = jnp.concatenate([sentinel, actions_ctx], axis=1)  # (B, T_ctx+1[, ...])
             step_idx = jnp.full((B, T_ctx + 1), e, dtype=jnp.int32)
             signal_idx_ctx = jnp.full((B, T_ctx), ctx_sig_for_full, dtype=jnp.int32)

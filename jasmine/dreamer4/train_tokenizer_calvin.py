@@ -70,7 +70,7 @@ class Args:
     model_dim: int = 512
     mlp_ratio: int = 4
     latent_dim: int = 32
-    num_latent_tokens: int = 16
+    num_latent_tokens: int = 32
     time_every: int = 3
     patch_size: int = 16
     num_blocks: int = 6
@@ -87,18 +87,17 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "tokenizer_dreamer4_calvin"
+    name: str = "tokenizer_dreamer4_calvin_nl32"
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4", "calvin"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/calvin/dreamer4/tokenizer"
+    ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/calvin/dreamer4/tokenizer_nl32"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
     val_interval: int = 20_000
     val_steps: int = 50
     wandb_id: str = ""
-
 
 
 

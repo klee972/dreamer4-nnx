@@ -1784,7 +1784,7 @@ class HierarchicalActionEncoder(nnx.Module):
         return out
 
 
-class CALVINActionEncoder(nnx.Module):
+class CALVINActionEncoderDiscrete(nnx.Module):
     """
     Action encoder for CALVIN 7D continuous actions (discretized per-dimension).
 
@@ -1861,6 +1861,59 @@ class CALVINActionEncoder(nnx.Module):
         return out
 
 
+class CALVINActionEncoderContinuous(nnx.Module):
+    """
+    MLP-based encoder for CALVIN 7D continuous actions (float32).
+
+    Expects actions of shape (B, T, 7) where:
+      [0:6] arm dims (delta pos x/y/z, delta ori a/b/c) — continuous float
+      [6]   gripper — -1.0 (close) or +1.0 (open)
+
+    Sentinel frames (first frame, no previous action) are indicated by NaN
+    values and output base_action_emb only.
+
+    Architecture: Linear(7 → d_model, SiLU) → LayerNorm → Linear(d_model → d_model)
+    Common in robot manipulation world models (GR-1, TD-MPC2 style).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        dtype: jnp.dtype,
+        param_dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.base_action_emb = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (d_model,))
+        )
+        self.fc1 = nnx.Linear(7, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.fc2 = nnx.Linear(d_model, d_model, use_bias=False, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.norm = nnx.LayerNorm(d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+
+    def __call__(
+        self,
+        actions: Optional[jnp.ndarray] = None,  # (B, T, 7) float32; NaN = sentinel
+        batch_time_shape: Optional[Tuple[int, int]] = None,
+        as_tokens: bool = True,
+    ):
+        if actions is None:
+            assert batch_time_shape is not None
+            B, T = batch_time_shape
+            out = jnp.broadcast_to(self.base_action_emb.value, (B, T, self.d_model))
+        else:
+            sentinel = jnp.isnan(actions[..., 0])                    # (B, T)
+            safe = jnp.where(jnp.isnan(actions), jnp.zeros_like(actions), actions)
+            h = jax.nn.silu(self.fc1(safe))                          # (B, T, d_model)
+            h = self.norm(self.fc2(h))                               # (B, T, d_model)
+            base = jnp.broadcast_to(self.base_action_emb.value, h.shape)
+            out = jnp.where(sentinel[..., None], base, h)            # sentinel → base_action_emb
+
+        if as_tokens:
+            out = out[:, :, None, :]
+        return out
+
+
 class DynamicsDreamer4(nnx.Module):
     def __init__(
         self,
@@ -1883,7 +1936,8 @@ class DynamicsDreamer4(nnx.Module):
         use_flash_attention: bool = True,
         pos_emb_type: str = "sinusoidal",  # "sinusoidal", "rope", or "none"
         n_camera: Optional[int] = None,    # If set, use HierarchicalActionEncoder (Minecraft)
-        n_arm_bins: Optional[int] = None,  # If set, use CALVINActionEncoder (CALVIN 7D)
+        n_arm_bins: Optional[int] = None,  # If set, use CALVINActionEncoderDiscrete (CALVIN 7D discrete)
+        calvin_actions: bool = False,      # If True, use CALVINActionEncoderContinuous (CALVIN 7D continuous)
         decode: bool = False,              # True for inference model with KV cache
     ):
         """
@@ -1917,8 +1971,12 @@ class DynamicsDreamer4(nnx.Module):
                 d_model=d_model, n_buttons=n_actions, n_camera=n_camera,
                 dtype=dtype, param_dtype=param_dtype, rngs=rngs,
             )
+        elif calvin_actions:
+            self.action_encoder = CALVINActionEncoderContinuous(
+                d_model=d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs,
+            )
         elif n_arm_bins is not None:
-            self.action_encoder = CALVINActionEncoder(
+            self.action_encoder = CALVINActionEncoderDiscrete(
                 d_model=d_model, n_arm_bins=n_arm_bins,
                 dtype=dtype, param_dtype=param_dtype, rngs=rngs,
             )

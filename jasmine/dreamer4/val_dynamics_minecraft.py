@@ -33,12 +33,12 @@ from jasmine.dreamer4.sampler import sample_video, SamplerConfig
 
 @dataclass
 class Args:
-    seed: int = 0
+    seed: int = 1
     seq_len: int = 64
     image_channels: int = 3
     image_height: int = 224
     image_width: int = 384
-    batch_size: int = 32
+    batch_size: int = 1
     # Common model
     time_every: int = 4
     mlp_ratio: int = 4
@@ -71,14 +71,14 @@ class Args:
     dyna_n_block: int = 20
     dyna_n_head: int = 24
     dyna_k_max: int = 64
-    ctx_length: int = 1
+    ctx_length: int = 8
     ctx_noise_tau: float = 0.9
     # Checkpoint
     ckpt_dir: str = "/home/4bkang/rl/jasmine/ckpts/minecraft/dreamer4/dynamics"
     restore_step: int = 0  # 0 = latest
     # Validation data
     val_data_dir: str = "/home/4bkang/rl/jasmine/data/minecraft_chunk64_224p_split/val"
-    val_steps: int = 5
+    val_steps: int = 2
     # Logging
     log: bool = True
     entity: str = "4bkang"
@@ -87,7 +87,10 @@ class Args:
     tags: list[str] = field(default_factory=lambda: ["val", "dynamics", "dreamer4"])
     wandb_id: str = ""
     # Validation regimes: any subset of ["shortcut_d4", "finest"]
-    eval_regimes: list[str] = field(default_factory=lambda: ["shortcut_d4", "finest"])
+    # eval_regimes: list[str] = field(default_factory=lambda: ["shortcut_d4", "finest"])
+    eval_regimes: list[str] = field(default_factory=lambda: ["shortcut_d4"])
+    n_viz = 2
+
 
 
 def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, DynamicsDreamer4]:
@@ -352,7 +355,7 @@ def main(args: Args) -> None:
         regimes = _eval_regimes_for_realism(args, ctx_length=ctx_length)
         tags = [tag for tag, _ in regimes]
 
-        N_VIZ = 10
+        N_VIZ = args.n_viz
         metrics_accum = {tag: {"latency": [], "mse": [], "psnr": []} for tag in tags}
         viz_gt    = {tag: [] for tag in tags}
         viz_recon = {tag: [] for tag in tags}

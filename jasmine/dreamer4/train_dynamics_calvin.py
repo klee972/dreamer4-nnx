@@ -32,7 +32,7 @@ import wandb
 import grain
 import flax.nnx as nnx
 
-from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer, CALVINActionMapping
+from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer
 from jasmine.utils.calvin_dataloader import get_calvin_dataloader
 from jasmine.utils.dataloader import get_dataloader
 from jasmine.utils.train_utils import (
@@ -51,7 +51,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_t
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 150_000
+    num_steps: int = 100_000
     seed: int = 0
     seq_len: int = 96
     image_channels: int = 3
@@ -76,11 +76,6 @@ class Args:
     time_every: int = 4
     mlp_ratio: int = 4
     dropout: float = 0.0
-    # CALVIN action space (CALVINActionMapping)
-    n_arm_bins: int = 21       # uniform bins for each of 6 arm dims (pos + ori)
-    arm_clip: float = 1.0      # clip continuous rel_actions to [-arm_clip, arm_clip]
-    use_mu_law: bool = True   # foveated quantization: finer bins near zero
-    mu: float = 10.0            # mu-law compression strength (larger = more foveation)
     param_dtype = jnp.float32
     dtype = jnp.bfloat16
     use_flash_attention: bool = True
@@ -129,13 +124,6 @@ class Args:
 
 
 def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, DynamicsDreamer4]:
-    action_mapper = CALVINActionMapping(
-        n_arm_bins=args.n_arm_bins,
-        arm_clip=args.arm_clip,
-        use_mu_law=args.use_mu_law,
-        mu=args.mu,
-    )
-    print(f"Action space: n_arm_bins={action_mapper.n_arm_bins}, n_gripper_bins=2, total_dims=7, use_mu_law={action_mapper.use_mu_law}, mu={action_mapper.mu}")
 
     tokenizer = TokenizerDreamer4(
         in_dim=args.image_channels,
@@ -164,9 +152,9 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         n_register=args.dyna_n_register,
         n_agent=args.dyna_n_agent,
         n_heads=args.dyna_n_head,
-        n_actions=1,           # dummy, not used by CALVINActionEncoder
+        n_actions=1,           # dummy, not used by CALVINActionEncoderContinuous
         n_camera=None,
-        n_arm_bins=args.n_arm_bins,
+        calvin_actions=True,
         depth=args.dyna_n_block,
         k_max=args.dyna_k_max,
         dropout=args.dropout,
@@ -210,7 +198,7 @@ def build_mesh_and_sharding(
     mesh = Mesh(devices=device_mesh_arr, axis_names=("data",))
     replicated_sharding = NamedSharding(mesh, PartitionSpec())
     videos_sharding = NamedSharding(mesh, PartitionSpec("data", None, None, None, None))
-    # CALVIN actions are per-dimension discrete (B, T, 7): [pos_x, pos_y, pos_z, ori_a, ori_b, ori_c, gripper]
+    # CALVIN actions: (B, T, 7) float32 continuous [arm x/y/z, ori a/b/c, gripper]; NaN = sentinel
     actions_sharding = NamedSharding(mesh, PartitionSpec("data", None, None))
     return mesh, replicated_sharding, videos_sharding, actions_sharding
 
@@ -597,9 +585,6 @@ def main(args: Args) -> None:
     rngs = nnx.Rngs(args.seed)
     rng = jax.random.PRNGKey(args.seed)
 
-    # --- Initialize action mapper ---
-    action_mapper = CALVINActionMapping(n_arm_bins=args.n_arm_bins, arm_clip=args.arm_clip)
-
     # --- Initialize model ---
     tokenizer, dynamics = build_model(args, rngs)
     _, params, _ = nnx.split(dynamics, nnx.Param, ...)
@@ -867,13 +852,13 @@ def main(args: Args) -> None:
         return val_metrics, val_videos, tags
 
     def _stack_actions(elem: dict) -> np.ndarray:
-        """Convert CALVIN continuous rel_actions (B, T, 7) float64 → (B, T, 7) int32.
+        """Shift CALVIN continuous rel_actions: frame 0 gets NaN sentinel, frame t gets action_{t-1}.
 
-        The dataloader yields T actions for T frames.  We shift by one:
-        frame 0 gets sentinel -1 (no previous action), frame t gets action_{t-1}.
+        Returns (B, T, 7) float32.
         """
-        discrete = action_mapper.continuous_to_indices(elem["actions"])  # (B, T, 7) int32
-        return action_mapper.stack_with_sentinel(discrete[:, :-1])       # (B, T, 7) int32
+        actions = elem["actions"][:, :-1].astype(np.float32)          # (B, T-1, 7) drop last
+        sentinel = np.full((actions.shape[0], 1, 7), np.nan, dtype=np.float32)
+        return np.concatenate([sentinel, actions], axis=1)             # (B, T, 7)
 
     # --- TRAIN LOOP ---
     def _make_sharded_batch(elem):

@@ -25,7 +25,7 @@ import flax.nnx as nnx
 from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental.mesh_utils import create_device_mesh
 
-from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer, CALVINActionMapping
+from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer
 from jasmine.utils.calvin_dataloader import get_calvin_dataloader
 from jasmine.utils.train_utils import get_lr_schedule, count_parameters_by_component
 from jasmine.dreamer4.sampler import sample_video, SamplerConfig
@@ -43,11 +43,7 @@ class Args:
     time_every: int = 4
     mlp_ratio: int = 4
     dropout: float = 0.0
-    # CALVIN action space
-    n_arm_bins: int = 21
-    arm_clip: float = 1.0
-    use_mu_law: bool = True
-    mu: float = 10.0
+
     param_dtype = jnp.float32
     dtype = jnp.bfloat16
     use_flash_attention: bool = True
@@ -96,12 +92,6 @@ class Args:
 
 
 def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, DynamicsDreamer4]:
-    action_mapper = CALVINActionMapping(
-        n_arm_bins=args.n_arm_bins,
-        arm_clip=args.arm_clip,
-        use_mu_law=args.use_mu_law,
-        mu=args.mu,
-    )
     tokenizer = TokenizerDreamer4(
         in_dim=args.image_channels,
         image_height=args.image_height,
@@ -129,9 +119,9 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         n_register=args.dyna_n_register,
         n_agent=args.dyna_n_agent,
         n_heads=args.dyna_n_head,
-        n_actions=1,  # dummy, not used by CALVINActionEncoder
+        n_actions=1,  # dummy, not used by CALVINActionEncoderContinuous
         n_camera=None,
-        n_arm_bins=args.n_arm_bins,
+        calvin_actions=True,
         depth=args.dyna_n_block,
         k_max=args.dyna_k_max,
         dropout=args.dropout,
@@ -155,7 +145,7 @@ def build_mesh_and_sharding(
     mesh = Mesh(devices=device_mesh_arr, axis_names=("data",))
     replicated_sharding = NamedSharding(mesh, PartitionSpec())
     videos_sharding = NamedSharding(mesh, PartitionSpec("data", None, None, None, None))
-    # CALVIN actions: (B, T, 7) hierarchical discrete
+    # CALVIN actions: (B, T, 7) float32 continuous [arm x/y/z, ori a/b/c, gripper]; NaN = sentinel
     actions_sharding = NamedSharding(mesh, PartitionSpec("data", None, None))
     return mesh, replicated_sharding, videos_sharding, actions_sharding
 
@@ -248,13 +238,6 @@ def main(args: Args) -> None:
     rngs = nnx.Rngs(args.seed)
     rng = jax.random.PRNGKey(args.seed)
 
-    action_mapper = CALVINActionMapping(
-        n_arm_bins=args.n_arm_bins,
-        arm_clip=args.arm_clip,
-        use_mu_law=args.use_mu_law,
-        mu=args.mu,
-    )
-
     # --- Build model ---
     tokenizer, dynamics = build_model(args, rngs)
     _, params, _ = nnx.split(dynamics, nnx.Param, ...)
@@ -300,8 +283,13 @@ def main(args: Args) -> None:
     val_iterator = build_val_dataloader(args)
 
     def _stack_actions(elem: dict) -> np.ndarray:
-        discrete = action_mapper.continuous_to_indices(elem["actions"])  # (B, T, 7) int32
-        return action_mapper.stack_with_sentinel(discrete[:, :-1])       # (B, T, 7) int32
+        """Shift CALVIN continuous rel_actions: frame 0 gets NaN sentinel, frame t gets action_{t-1}.
+
+        Returns (B, T, 7) float32.
+        """
+        actions = elem["actions"][:, :-1].astype(np.float32)          # (B, T-1, 7) drop last
+        sentinel = np.full((actions.shape[0], 1, 7), np.nan, dtype=np.float32)
+        return np.concatenate([sentinel, actions], axis=1)             # (B, T, 7)
 
     dataloader_val = (
         {

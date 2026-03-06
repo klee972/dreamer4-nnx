@@ -186,22 +186,6 @@ def shard_optimizer_states(
 
 def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
     image_shape = (args.image_height, args.image_width, args.image_channels)
-    # array_record_files = [
-    #     os.path.join(data_dir, x)
-    #     for x in os.listdir(data_dir)
-    #     if x.endswith(".array_record")
-    # ]
-    # grain_dataloader = get_dataloader(
-    #     array_record_files,
-    #     args.seq_len,
-    #     # NOTE: We deliberately pass the global batch size
-    #     # The dataloader shards the dataset across all processes
-    #     args.batch_size,
-    #     *image_shape,
-    #     num_workers=8,
-    #     prefetch_buffer_size=8,  # Increased for larger images to avoid data loading bottleneck
-    #     seed=args.seed,
-    # )
     grain_dataloader = get_video_dataloader(
         data_dir,
         args.seq_len,

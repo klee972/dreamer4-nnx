@@ -56,10 +56,16 @@ class Args:
     d_latent: int = 64
     n_latent: int = 32
     # Tokenizer
-    tokenizer_d_model: int = 768
-    tokenizer_n_block: int = 12
-    tokenizer_n_head: int = 12
-    tokenizer_time_every: int = 4
+    tokenizer_enc_model_dim: int = 768
+    tokenizer_enc_mlp_ratio: int = 4
+    tokenizer_enc_time_every: int = 4
+    tokenizer_enc_n_block: int = 12
+    tokenizer_enc_n_head: int = 12
+    tokenizer_dec_model_dim: int = 768
+    tokenizer_dec_mlp_ratio: int = 4
+    tokenizer_dec_time_every: int = 4
+    tokenizer_dec_n_block: int = 12
+    tokenizer_dec_n_head: int = 12
     tokenizer_checkpoint: str = "ckpts/minecraft/dreamer4/tokenizer"
     # Dynamics
     dyna_d_model: int = 1536
@@ -103,14 +109,18 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         in_dim=args.image_channels,
         image_height=args.image_height,
         image_width=args.image_width,
-        model_dim=args.tokenizer_d_model,
-        mlp_ratio=args.mlp_ratio,
+        enc_model_dim=args.tokenizer_enc_model_dim,
+        enc_mlp_ratio=args.tokenizer_enc_mlp_ratio,
+        enc_time_every=args.tokenizer_enc_time_every,
+        enc_num_blocks=args.tokenizer_enc_n_block,
+        enc_num_heads=args.tokenizer_enc_n_head,
+        dec_model_dim=args.tokenizer_dec_model_dim,
+        dec_mlp_ratio=args.tokenizer_dec_mlp_ratio,
+        dec_time_every=args.tokenizer_dec_time_every,
+        dec_num_blocks=args.tokenizer_dec_n_block,
+        dec_num_heads=args.tokenizer_dec_n_head,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
-        time_every=args.time_every,
-        patch_size=args.patch_size,
-        num_blocks=args.tokenizer_n_block,
-        num_heads=args.tokenizer_n_head,
         dropout=args.dropout,
         max_mask_ratio=0.0,
         param_dtype=args.param_dtype,

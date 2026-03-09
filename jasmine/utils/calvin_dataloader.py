@@ -219,7 +219,7 @@ def get_calvin_dataloader(
         sampler=sampler,
         operations=operations,
         worker_count=num_workers,
-        worker_buffer_size=4,
+        worker_buffer_size=32,
         read_options=read_options,
     )
 

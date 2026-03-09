@@ -1,5 +1,6 @@
 import math
 import itertools
+import os
 from typing import Tuple, Callable, Dict, Any, Optional
 from collections import OrderedDict
 from enum import IntEnum
@@ -831,14 +832,19 @@ class TokenizerDreamer4(nnx.Module):
         in_dim: int,
         image_height: int,
         image_width: int,
-        model_dim: int,
-        mlp_ratio: int,
+        enc_model_dim: int,
+        enc_mlp_ratio: int,
+        enc_time_every: int,
+        enc_num_blocks: int,
+        enc_num_heads: int,
+        dec_model_dim: int,
+        dec_mlp_ratio: int,
+        dec_time_every: int,
+        dec_num_blocks: int,
+        dec_num_heads: int,
         latent_dim: int,
         num_latent_tokens: int,
-        time_every: int,
         patch_size: int,
-        num_blocks: int,
-        num_heads: int,
         dropout: float,
         max_mask_ratio: float,
         param_dtype: jnp.dtype,
@@ -850,14 +856,19 @@ class TokenizerDreamer4(nnx.Module):
         self.in_dim = in_dim
         self.image_height = image_height
         self.image_width = image_width
-        self.model_dim = model_dim
-        self.mlp_ratio = mlp_ratio
+        self.enc_model_dim = enc_model_dim
+        self.enc_mlp_ratio = enc_mlp_ratio
+        self.enc_time_every = enc_time_every
+        self.enc_num_blocks = enc_num_blocks
+        self.enc_num_heads = enc_num_heads
+        self.dec_model_dim = dec_model_dim
+        self.dec_mlp_ratio = dec_mlp_ratio
+        self.dec_time_every = dec_time_every
+        self.dec_num_blocks = dec_num_blocks
+        self.dec_num_heads = dec_num_heads
         self.latent_dim = latent_dim
         self.num_latent_tokens = num_latent_tokens
-        self.time_every = time_every
         self.patch_size = patch_size
-        self.num_blocks = num_blocks
-        self.num_heads = num_heads
         self.dropout = dropout
         self.max_mask_ratio = max_mask_ratio
         self.param_dtype = param_dtype
@@ -873,10 +884,10 @@ class TokenizerDreamer4(nnx.Module):
         self.modality_ids = self.layout.modality_ids()
 
         self.encoder = ModalityAxialTransformer(
-            self.model_dim,
-            self.mlp_ratio,
-            self.num_blocks,
-            self.num_heads,
+            self.enc_model_dim,
+            self.enc_mlp_ratio,
+            self.enc_num_blocks,
+            self.enc_num_heads,
             self.dropout,
             self.param_dtype,
             self.dtype,
@@ -886,11 +897,11 @@ class TokenizerDreamer4(nnx.Module):
             rngs=rngs,
             mode="encoder",
             modality_ids=self.modality_ids,
-            time_every=self.time_every,
+            time_every=self.enc_time_every,
             pos_emb_type=self.pos_emb_type,
         )
         self.encoder_proj = nnx.Linear(
-            in_features=self.model_dim,
+            in_features=self.enc_model_dim,
             out_features=self.latent_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -898,10 +909,10 @@ class TokenizerDreamer4(nnx.Module):
         )
 
         self.decoder = ModalityAxialTransformer(
-            self.model_dim,
-            self.mlp_ratio,
-            self.num_blocks,
-            self.num_heads,
+            self.dec_model_dim,
+            self.dec_mlp_ratio,
+            self.dec_num_blocks,
+            self.dec_num_heads,
             self.dropout,
             self.param_dtype,
             self.dtype,
@@ -911,12 +922,12 @@ class TokenizerDreamer4(nnx.Module):
             rngs=rngs,
             mode="decoder",
             modality_ids=self.modality_ids,
-            time_every=self.time_every,
+            time_every=self.dec_time_every,
             pos_emb_type=self.pos_emb_type,
         )
         self.out_dim = self.in_dim * self.patch_size**2
         self.decoder_proj = nnx.Linear(
-            in_features=self.model_dim,
+            in_features=self.dec_model_dim,
             out_features=self.out_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
@@ -924,31 +935,31 @@ class TokenizerDreamer4(nnx.Module):
         )
         self.patch_proj = nnx.Linear(
             in_features=self.in_dim * self.patch_size**2,
-            out_features=self.model_dim,
+            out_features=self.enc_model_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
             rngs=rngs,
         )
         self.latent_proj = nnx.Linear(
             in_features=self.latent_dim,
-            out_features=self.model_dim,
+            out_features=self.dec_model_dim,
             param_dtype=self.param_dtype,
             dtype=self.dtype,
             rngs=rngs,
         )
         self.mask_patch = nnx.Param(
             nnx.initializers.normal()(
-                rngs.params(), (1, 1, 1, self.model_dim)
+                rngs.params(), (1, 1, 1, self.enc_model_dim)
             )
         )
         self.latent_tokens = nnx.Param(
             nnx.initializers.normal()(
-                rngs.params(), (self.num_latent_tokens, self.model_dim)
+                rngs.params(), (self.num_latent_tokens, self.enc_model_dim)
             )
         )
         self.query_tokens = nnx.Param(
             nnx.initializers.normal()(
-                rngs.params(), (N, self.model_dim)
+                rngs.params(), (N, self.dec_model_dim)
             )
         )
 
@@ -2171,7 +2182,7 @@ def restore_dreamer4_tokenizer(
         step_format_fixed_length=6,
     )
     tokenizer_checkpoint_manager = ocp.CheckpointManager(
-        directory=args.tokenizer_checkpoint,
+        directory=os.path.abspath(args.tokenizer_checkpoint),
         options=checkpoint_options,
         handler_registry=handler_registry,
     )
@@ -2181,21 +2192,26 @@ def restore_dreamer4_tokenizer(
         in_dim=args.image_channels,
         image_height=args.image_height,
         image_width=args.image_width,
-        model_dim=args.tokenizer_d_model,
-        mlp_ratio=args.mlp_ratio,
+        enc_model_dim=args.tokenizer_enc_model_dim,
+        enc_mlp_ratio=args.tokenizer_enc_mlp_ratio,
+        enc_time_every=args.tokenizer_enc_time_every,
+        enc_num_blocks=args.tokenizer_enc_n_block,
+        enc_num_heads=args.tokenizer_enc_n_head,
+        dec_model_dim=args.tokenizer_dec_model_dim,
+        dec_mlp_ratio=args.tokenizer_dec_mlp_ratio,
+        dec_time_every=args.tokenizer_dec_time_every,
+        dec_num_blocks=args.tokenizer_dec_n_block,
+        dec_num_heads=args.tokenizer_dec_n_head,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
-        time_every=args.tokenizer_time_every,
         patch_size=args.patch_size,
-        num_blocks=args.tokenizer_n_block,
-        num_heads=args.tokenizer_n_head,
         dropout=args.dropout,
         max_mask_ratio=0.0,
         param_dtype=args.param_dtype,
         dtype=args.dtype,
         use_flash_attention=args.use_flash_attention,
         rngs=rngs,
-        pos_emb_type=getattr(args, 'pos_emb_type', 'sinusoidal'),
+        pos_emb_type=getattr(args, 'pos_emb_type', 'rope'),
     )
 
     # Wrap in ModelAndOptimizer to match checkpoint format

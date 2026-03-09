@@ -22,8 +22,10 @@ import grain
 import flax.nnx as nnx
 from jaxlpips import LPIPS
 
+import glob
+
 from jasmine.models.dreamer4_models import TokenizerDreamer4
-from jasmine.utils.calvin_dataloader import get_calvin_dataloader
+from jasmine.utils.dataloader import get_dataloader
 from jasmine.utils.train_utils import (
     get_lr_schedule,
     count_parameters_by_component,
@@ -36,7 +38,6 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify
 
 
 
-
 @dataclass
 class Args:
     # Experiment
@@ -44,19 +45,18 @@ class Args:
     seed: int = 0
     seq_len: int = 96
     image_channels: int = 3
-    image_height: int = 200
-    image_width: int = 200
+    image_height: int = 96
+    image_width: int = 96
     save_ckpt: bool = True
     restore_ckpt: bool = False
     restore_step: int = 5000
     # CALVIN data
     train_data_dirs: list[str] = field(default_factory=lambda: [
-        "/home/4bkang/rl/calvin/dataset/task_ABCD_D/training/",
+        "data/calvin_96p_clips/train",
     ])
     val_data_dirs: list[str] = field(default_factory=lambda: [
-        "/home/4bkang/rl/calvin/dataset/task_ABCD_D/validation/",
+        "data/calvin_96p_clips/val",
     ])
-    image_key: str = "rgb_static"
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -67,14 +67,19 @@ class Args:
     warmup_steps: int = 6000
     optimizer: str = "adamw"  # supported options: adamw, muon
     # Tokenizer
-    model_dim: int = 512
-    mlp_ratio: int = 4
+    enc_model_dim: int = 512
+    enc_mlp_ratio: int = 4
+    enc_time_every: int = 3
+    enc_num_blocks: int = 6
+    enc_num_heads: int = 8
+    dec_model_dim: int = 512
+    dec_mlp_ratio: int = 4
+    dec_time_every: int = 2
+    dec_num_blocks: int = 4
+    dec_num_heads: int = 8
     latent_dim: int = 32
     num_latent_tokens: int = 32
-    time_every: int = 3
     patch_size: int = 16
-    num_blocks: int = 6
-    num_heads: int = 8
     dropout: float = 0.0
     max_mask_ratio: float = 0.9
     param_dtype = jnp.float32
@@ -87,11 +92,11 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "tokenizer_dreamer4_calvin_nl32"
+    name: str = "tokenizer_dreamer4_calvin_96p"
     tags: list[str] = field(default_factory=lambda: ["tokenizer", "dreamer4", "calvin"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "ckpts/calvin/dreamer4/tokenizer_nl32"
+    ckpt_dir: str = "ckpts/calvin/dreamer4/tokenizer_96p"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 20_000
     log_gradients: bool = False
@@ -109,14 +114,19 @@ def build_model(args: Args, rng: jax.Array) -> tuple[TokenizerDreamer4, jax.Arra
         in_dim=args.image_channels,
         image_height=args.image_height,
         image_width=args.image_width,
-        model_dim=args.model_dim,
-        mlp_ratio=args.mlp_ratio,
+        enc_model_dim=args.enc_model_dim,
+        enc_mlp_ratio=args.enc_mlp_ratio,
+        enc_time_every=args.enc_time_every,
+        enc_num_blocks=args.enc_num_blocks,
+        enc_num_heads=args.enc_num_heads,
+        dec_model_dim=args.dec_model_dim,
+        dec_mlp_ratio=args.dec_mlp_ratio,
+        dec_time_every=args.dec_time_every,
+        dec_num_blocks=args.dec_num_blocks,
+        dec_num_heads=args.dec_num_heads,
         latent_dim=args.latent_dim,
         num_latent_tokens=args.num_latent_tokens,
-        time_every=args.time_every,
         patch_size=args.patch_size,
-        num_blocks=args.num_blocks,
-        num_heads=args.num_heads,
         dropout=args.dropout,
         max_mask_ratio=args.max_mask_ratio,
         param_dtype=args.param_dtype,
@@ -184,13 +194,16 @@ def shard_optimizer_states(
 
 
 def build_dataloader(args: Args, data_dirs: list[str]) -> grain.DataLoaderIterator:
-    grain_dataloader = get_calvin_dataloader(
-        data_dirs=data_dirs,
+    array_record_paths = []
+    for d in data_dirs:
+        array_record_paths.extend(sorted(glob.glob(os.path.join(d, "*.array_record"))))
+    grain_dataloader = get_dataloader(
+        array_record_paths=array_record_paths,
         seq_len=args.seq_len,
         global_batch_size=args.batch_size,
-        image_key=args.image_key,
         image_h=args.image_height,
         image_w=args.image_width,
+        image_c=args.image_channels,
         num_workers=8,
         prefetch_buffer_size=8,
         seed=args.seed,

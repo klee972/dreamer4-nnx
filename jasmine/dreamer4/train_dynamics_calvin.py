@@ -30,10 +30,10 @@ import jax.numpy as jnp
 import tyro
 import wandb
 import grain
+import glob
 import flax.nnx as nnx
 
 from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer
-from jasmine.utils.calvin_dataloader import get_calvin_dataloader
 from jasmine.utils.dataloader import get_dataloader
 from jasmine.utils.train_utils import (
     get_lr_schedule,
@@ -47,7 +47,6 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_t
 
 
 
-
 @dataclass
 class Args:
     # Experiment
@@ -55,11 +54,11 @@ class Args:
     seed: int = 0
     seq_len: int = 96
     image_channels: int = 3
-    image_height: int = 200
-    image_width: int = 200
-    data_dir: str = "/home/4bkang/rl/calvin/dataset/task_ABCD_D/training"
+    image_height: int = 96
+    image_width: int = 96
+    train_data_dirs: list[str] = field(default_factory=lambda: ["data/calvin_96p_clips/train"])
     save_ckpt: bool = True
-    restore_ckpt: bool = True
+    restore_ckpt: bool = False
     restore_step: int = 0
     # Optimization
     batch_size: int = 32
@@ -83,43 +82,49 @@ class Args:
     pos_emb_type: str = "rope"
     # Latent tokens
     d_latent: int = 32
-    n_latent: int = 16
+    n_latent: int = 32
     # Tokenizer
-    tokenizer_d_model: int = 512
-    tokenizer_time_every: int = 3
-    tokenizer_n_block: int = 6
-    tokenizer_n_head: int = 8
-    tokenizer_checkpoint: str = "ckpts/calvin/dreamer4/tokenizer"
+    tokenizer_enc_model_dim: int = 512
+    tokenizer_enc_mlp_ratio: int = 4
+    tokenizer_enc_time_every: int = 3
+    tokenizer_enc_n_block: int = 6
+    tokenizer_enc_n_head: int = 8
+    tokenizer_dec_model_dim: int = 512
+    tokenizer_dec_mlp_ratio: int = 4
+    tokenizer_dec_time_every: int = 2
+    tokenizer_dec_n_block: int = 4
+    tokenizer_dec_n_head: int = 8
+    tokenizer_checkpoint: str = "ckpts/calvin/dreamer4/tokenizer_96p"
     # Dynamics
-    dyna_d_model: int = 1024
+    dyna_d_model: int = 768
     dyna_packing_factor: int = 1
     dyna_d_spatial: int = 32  # must equal dyna_packing_factor * d_latent
-    dyna_n_spatial: int = 16  # should be dyna_n_spatial * dyna_packing_factor = n_latent
+    dyna_n_spatial: int = 32  # should be dyna_n_spatial * dyna_packing_factor = n_latent
     dyna_n_register: int = 4
     dyna_n_agent: int = 1
     dyna_n_block: int = 12
-    dyna_n_head: int = 16
-    dyna_k_max: int = 64
+    dyna_n_head: int = 12
+    dyna_k_max: int = 128
     batch_size_self: int = batch_size // 2
     seq_len_short: int = 24       # short branch T; ignored when seq_len_ratio == 0.0
-    seq_len_ratio: float = 0.75    # fraction of batch assigned to short branch (0.0 = disabled)
-    ctx_length: int = 1  # num. gt frames given when validating
+    seq_len_ratio: float = 0.0    # fraction of batch assigned to short branch (0.0 = disabled)
+    ctx_length: int = 8  # num. gt frames given when validating
     # Logging
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "dynamics_dreamer4_calvin"
+    name: str = "dynamics_dreamer4_calvin_96p"
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics"
-    log_checkpoint_interval: int = 5000
+    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics_96p"
+    log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
-    val_data_dir: str = "/home/4bkang/rl/calvin/dataset/task_ABCD_D/validation"
+    val_data_dirs: list[str] = field(default_factory=lambda: ["data/calvin_96p_clips/val"])
     val_interval: int = 10_000
     val_steps: int = 5
-    wandb_id: str = "zl8aepyc"
+    wandb_id: str = ""
 
 
 
@@ -129,14 +134,19 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         in_dim=args.image_channels,
         image_height=args.image_height,
         image_width=args.image_width,
-        model_dim=args.tokenizer_d_model,
-        mlp_ratio=args.mlp_ratio,
+        enc_model_dim=args.tokenizer_enc_model_dim,
+        enc_mlp_ratio=args.tokenizer_enc_mlp_ratio,
+        enc_time_every=args.tokenizer_enc_time_every,
+        enc_num_blocks=args.tokenizer_enc_n_block,
+        enc_num_heads=args.tokenizer_enc_n_head,
+        dec_model_dim=args.tokenizer_dec_model_dim,
+        dec_mlp_ratio=args.tokenizer_dec_mlp_ratio,
+        dec_time_every=args.tokenizer_dec_time_every,
+        dec_num_blocks=args.tokenizer_dec_n_block,
+        dec_num_heads=args.tokenizer_dec_n_head,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
-        time_every=args.tokenizer_time_every,
         patch_size=args.patch_size,
-        num_blocks=args.tokenizer_n_block,
-        num_heads=args.tokenizer_n_head,
         dropout=args.dropout,
         max_mask_ratio=0.0,
         param_dtype=args.param_dtype,
@@ -218,43 +228,22 @@ def shard_optimizer_states(
     nnx.update(optimizer, optimizer_sharded_state)
 
 
-def build_dataloader(args: Args, data_dir: str) -> grain.DataLoaderIterator:
-    grain_dataloader = get_calvin_dataloader(
-        data_dirs=[data_dir],
-        seq_len=args.seq_len,
-        # NOTE: We deliberately pass the global batch size
-        # The dataloader shards the dataset across all processes
-        global_batch_size=args.batch_size,
-        image_key="rgb_static",
-        image_h=args.image_height,
-        image_w=args.image_width,
-        num_workers=8,
-        prefetch_buffer_size=8,
-        seed=args.seed,
-        load_actions=True,
-        action_key="rel_actions",
-    )
-    initial_state = grain_dataloader._create_initial_state()
-    grain_iterator = grain.DataLoaderIterator(grain_dataloader, initial_state)
-    return grain_iterator
-
-
-def build_dataloader_with_seq_len(
-    args: Args, data_dir: str, seq_len: int, batch_size: int, seed: int | None = None
+def build_dataloader(
+    args: Args, data_dirs: list[str], seq_len: int | None = None, batch_size: int | None = None, seed: int | None = None
 ) -> grain.DataLoaderIterator:
-    """Like build_dataloader but with explicit seq_len and batch_size overrides."""
-    grain_dataloader = get_calvin_dataloader(
-        data_dirs=[data_dir],
-        seq_len=seq_len,
-        global_batch_size=batch_size,
-        image_key="rgb_static",
+    array_record_paths = []
+    for d in data_dirs:
+        array_record_paths.extend(sorted(glob.glob(os.path.join(d, "*.array_record"))))
+    grain_dataloader = get_dataloader(
+        array_record_paths=array_record_paths,
+        seq_len=seq_len if seq_len is not None else args.seq_len,
+        global_batch_size=batch_size if batch_size is not None else args.batch_size,
         image_h=args.image_height,
         image_w=args.image_width,
+        image_c=args.image_channels,
         num_workers=8,
         prefetch_buffer_size=8,
         seed=seed if seed is not None else args.seed,
-        load_actions=True,
-        action_key="rel_actions",
     )
     initial_state = grain_dataloader._create_initial_state()
     grain_iterator = grain.DataLoaderIterator(grain_dataloader, initial_state)
@@ -280,7 +269,7 @@ def build_checkpoint_manager(args: Args) -> Optional[ocp.CheckpointManager]:
             grain.checkpoint.CheckpointRestore,
             cast(ocp.handlers.CheckpointHandler, grain.checkpoint.CheckpointHandler),
         )
-        if args.val_data_dir:
+        if args.val_data_dirs:
             handler_registry.add(
                 "val_dataloader_state",
                 grain.checkpoint.CheckpointSave,
@@ -303,7 +292,7 @@ def build_checkpoint_manager(args: Args) -> Optional[ocp.CheckpointManager]:
             cleanup_tmp_directories=True,
         )
         checkpoint_manager = ocp.CheckpointManager(
-            args.ckpt_dir,
+            os.path.abspath(args.ckpt_dir),
             options=checkpoint_options,
             handler_registry=handler_registry,
         )
@@ -648,18 +637,18 @@ def main(args: Args) -> None:
 
     # --- Create DataLoaderIterator from dataloader ---
     if args.seq_len_ratio > 0.0:
-        train_iterator = build_dataloader_with_seq_len(
-            args, args.data_dir, seq_len=T_long, batch_size=B_long
+        train_iterator = build_dataloader(
+            args, args.train_data_dirs, seq_len=T_long, batch_size=B_long
         )
-        short_iterator = build_dataloader_with_seq_len(
-            args, args.data_dir, seq_len=T_short, batch_size=B_short,
+        short_iterator = build_dataloader(
+            args, args.train_data_dirs, seq_len=T_short, batch_size=B_short,
             seed=args.seed + 1,  # independent episode sampling
         )
     else:
-        train_iterator = build_dataloader(args, args.data_dir)
+        train_iterator = build_dataloader(args, args.train_data_dirs)
     val_iterator = None
-    if args.val_data_dir:
-        val_iterator = build_dataloader(args, args.val_data_dir)
+    if args.val_data_dirs:
+        val_iterator = build_dataloader(args, args.val_data_dirs)
 
     # --- Restore checkpoint ---
     step, optimizer, tokenizer, train_iterator, val_iterator, rng = (
@@ -854,11 +843,11 @@ def main(args: Args) -> None:
     def _stack_actions(elem: dict) -> np.ndarray:
         """Shift CALVIN continuous rel_actions: frame 0 gets NaN sentinel, frame t gets action_{t-1}.
 
-        Returns (B, T, 7) float32.
+        Returns (B, T, 7) bfloat16 — matches model dtype to avoid mixed-precision collective-permute.
         """
-        actions = elem["actions"][:, :-1].astype(np.float32)          # (B, T-1, 7) drop last
-        sentinel = np.full((actions.shape[0], 1, 7), np.nan, dtype=np.float32)
-        return np.concatenate([sentinel, actions], axis=1)             # (B, T, 7)
+        actions = elem["actions"][:, :-1].astype(args.dtype)           # (B, T-1, 7) bf16
+        sentinel = np.full((actions.shape[0], 1, 7), np.nan, dtype=args.dtype)
+        return np.concatenate([sentinel, actions], axis=1)             # (B, T, 7) bf16
 
     # --- TRAIN LOOP ---
     def _make_sharded_batch(elem):

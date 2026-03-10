@@ -58,7 +58,7 @@ class Args:
     image_width: int = 384
     data_dir: str = "data/minecraft_chunk64_224p_split/train"
     save_ckpt: bool = True
-    restore_ckpt: bool = False
+    restore_ckpt: bool = True
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -110,7 +110,7 @@ class Args:
     dyna_k_max: int = 64
     batch_size_self: int = batch_size // 2
     seq_len_short: int = 16       # short branch T; ignored when seq_len_ratio == 0.0
-    seq_len_ratio: float = 0.75    # fraction of batch assigned to short branch (0.0 = disabled)
+    seq_len_ratio: float = 0.0    # fraction of batch assigned to short branch (0.0 = disabled)
     ctx_length: int = 8  # num. gt frames given when validating
     # Logging
     log: bool = True
@@ -121,13 +121,14 @@ class Args:
     log_interval: int = 50
     log_image_interval: int = 1000
     ckpt_dir: str = "ckpts/minecraft/dreamer4/dynamics"
-    log_checkpoint_interval: int = 5000
+    log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
     val_data_dir: str = "data/minecraft_chunk64_224p_split/val"
     val_interval: int = 10_000
     val_steps: int = 5
-    wandb_id: str = ""
+    wandb_id: str = "77v47492"
+
 
 
 
@@ -156,6 +157,7 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         dec_num_heads=args.tokenizer_dec_n_head,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
+        patch_size=args.patch_size,
         dropout=args.dropout,
         max_mask_ratio=0.0,
         param_dtype=args.param_dtype,

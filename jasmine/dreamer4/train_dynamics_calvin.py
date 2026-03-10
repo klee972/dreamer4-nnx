@@ -50,7 +50,7 @@ from jasmine.utils.dreamer4_utils import patchify, unpatchify, pack_bottleneck_t
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 100_000
+    num_steps: int = 50_000
     seed: int = 0
     seq_len: int = 96
     image_channels: int = 3
@@ -58,15 +58,15 @@ class Args:
     image_width: int = 96
     train_data_dirs: list[str] = field(default_factory=lambda: ["data/calvin_96p_clips/train"])
     save_ckpt: bool = True
-    restore_ckpt: bool = False
-    restore_step: int = 0
+    restore_ckpt: bool = True
+    restore_step: int = 40000
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
     max_lr: float = 3e-4
     decay_end: float = 0.0
     wsd_decay_steps: int = (
-        30_000  # NOTE: wsd_decay_steps will only be used when using a wsd-schedule
+        10_000  # NOTE: wsd_decay_steps will only be used when using a wsd-schedule
     )
     warmup_steps: int = 5000
     lr_schedule: str = "wsd"  # supported options: wsd, cos
@@ -113,7 +113,7 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "dynamics_dreamer4_calvin_96p"
+    name: str = "dynamics_dreamer4_calvin_96p_continued"
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
@@ -125,6 +125,7 @@ class Args:
     val_interval: int = 10_000
     val_steps: int = 5
     wandb_id: str = ""
+
 
 
 

@@ -121,6 +121,7 @@ def build_model(args: Args, rngs: nnx.Rngs) -> tuple[TokenizerDreamer4, Dynamics
         dec_num_heads=args.tokenizer_dec_n_head,
         latent_dim=args.d_latent,
         num_latent_tokens=args.n_latent,
+        patch_size=args.patch_size,
         dropout=args.dropout,
         max_mask_ratio=0.0,
         param_dtype=args.param_dtype,

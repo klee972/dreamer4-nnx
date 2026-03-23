@@ -58,8 +58,8 @@ class Args:
     image_width: int = 96
     train_data_dirs: list[str] = field(default_factory=lambda: ["data/calvin_96p_clips/train"])
     save_ckpt: bool = True
-    restore_ckpt: bool = True
-    restore_step: int = 40000
+    restore_ckpt: bool = False
+    restore_step: int = 0
     # Optimization
     batch_size: int = 32
     init_lr: float = 0.0
@@ -102,7 +102,7 @@ class Args:
     dyna_n_spatial: int = 32  # should be dyna_n_spatial * dyna_packing_factor = n_latent
     dyna_n_register: int = 4
     dyna_n_agent: int = 1
-    dyna_n_block: int = 12
+    dyna_n_block: int = 8
     dyna_n_head: int = 12
     dyna_k_max: int = 128
     batch_size_self: int = batch_size // 2
@@ -113,11 +113,11 @@ class Args:
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "dynamics_dreamer4_calvin_96p_continued"
+    name: str = "dynamics_dreamer4_calvin_96p_s"
     tags: list[str] = field(default_factory=lambda: ["dynamics", "dreamer4"])
     log_interval: int = 50
     log_image_interval: int = 1000
-    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics_96p"
+    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics_96p_s"
     log_checkpoint_interval: int = 1000
     log_checkpoint_keep_period: int = 10_000
     log_gradients: bool = False
@@ -125,6 +125,7 @@ class Args:
     val_interval: int = 10_000
     val_steps: int = 5
     wandb_id: str = ""
+
 
 
 

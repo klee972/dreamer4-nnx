@@ -5,6 +5,7 @@ Loads a dynamics checkpoint and evaluates on the validation dataset
 using sample_video. Logs metrics and side-by-side videos to wandb.
 """
 
+import glob
 import os
 import time
 
@@ -26,7 +27,7 @@ from jax.sharding import Mesh, PartitionSpec, NamedSharding
 from jax.experimental.mesh_utils import create_device_mesh
 
 from jasmine.models.dreamer4_models import DynamicsDreamer4, TokenizerDreamer4, restore_dreamer4_tokenizer
-from jasmine.utils.calvin_dataloader import get_calvin_dataloader
+from jasmine.utils.dataloader import get_dataloader
 from jasmine.utils.train_utils import get_lr_schedule, count_parameters_by_component
 from jasmine.dreamer4.sampler import sample_video, SamplerConfig
 
@@ -36,9 +37,9 @@ class Args:
     seed: int = 0
     seq_len: int = 96
     image_channels: int = 3
-    image_height: int = 200
-    image_width: int = 200
-    batch_size: int = 10
+    image_height: int = 96
+    image_width: int = 96
+    batch_size: int = 1
     # Common model
     time_every: int = 4
     mlp_ratio: int = 4
@@ -51,7 +52,7 @@ class Args:
     pos_emb_type: str = "rope"
     # Latent tokens
     d_latent: int = 32
-    n_latent: int = 16
+    n_latent: int = 32
     # Tokenizer
     tokenizer_enc_model_dim: int = 512
     tokenizer_enc_mlp_ratio: int = 4
@@ -60,33 +61,33 @@ class Args:
     tokenizer_enc_n_head: int = 8
     tokenizer_dec_model_dim: int = 512
     tokenizer_dec_mlp_ratio: int = 4
-    tokenizer_dec_time_every: int = 3
-    tokenizer_dec_n_block: int = 6
+    tokenizer_dec_time_every: int = 2
+    tokenizer_dec_n_block: int = 4
     tokenizer_dec_n_head: int = 8
-    tokenizer_checkpoint: str = "ckpts/calvin/dreamer4/tokenizer"
+    tokenizer_checkpoint: str = "ckpts/calvin/dreamer4/tokenizer_96p"
     # Dynamics
-    dyna_d_model: int = 1024
+    dyna_d_model: int = 768
     dyna_packing_factor: int = 1
     dyna_d_spatial: int = 32
-    dyna_n_spatial: int = 16
+    dyna_n_spatial: int = 32
     dyna_n_register: int = 4
     dyna_n_agent: int = 1
-    dyna_n_block: int = 12
-    dyna_n_head: int = 16
-    dyna_k_max: int = 64
-    ctx_length: int = 1
+    dyna_n_block: int = 8
+    dyna_n_head: int = 12
+    dyna_k_max: int = 128
+    ctx_length: int = 8
     ctx_noise_tau: float = 0.9
     # Checkpoint
-    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics"
+    ckpt_dir: str = "ckpts/calvin/dreamer4/dynamics_96p_s"
     restore_step: int = 0  # 0 = latest
     # Validation data
-    val_data_dir: str = "/home/4bkang/rl/calvin/dataset/task_ABCD_D/validation"
-    val_steps: int = 1
+    val_data_dir: str = "data/calvin_96p_clips/val"
+    val_steps: int = 2
     # Logging
     log: bool = True
     entity: str = "4bkang"
     project: str = "jasmine"
-    name: str = "val_dynamics_dreamer4_calvin"
+    name: str = "val_dynamics_dreamer4_calvin_96p_s"
     tags: list[str] = field(default_factory=lambda: ["val", "dynamics", "dreamer4"])
     wandb_id: str = ""
     # Validation regimes: any subset of ["shortcut_d4", "finest"]
@@ -171,7 +172,7 @@ def restore_dynamics(
         "model_state", ocp.args.PyTreeRestore, ocp.handlers.PyTreeCheckpointHandler
     )
     checkpoint_manager = ocp.CheckpointManager(
-        args.ckpt_dir,
+        os.path.abspath(args.ckpt_dir),
         options=ocp.CheckpointManagerOptions(step_format_fixed_length=6),
         handler_registry=handler_registry,
     )
@@ -200,18 +201,19 @@ def restore_dynamics(
 
 
 def build_val_dataloader(args: Args) -> grain.DataLoaderIterator:
-    grain_dataloader = get_calvin_dataloader(
-        data_dirs=[args.val_data_dir],
+    array_record_paths = sorted(
+        glob.glob(os.path.join(args.val_data_dir, "*.array_record"))
+    )
+    grain_dataloader = get_dataloader(
+        array_record_paths=array_record_paths,
         seq_len=args.seq_len,
         global_batch_size=args.batch_size,
-        image_key="rgb_static",
         image_h=args.image_height,
         image_w=args.image_width,
-        num_workers=4,
-        prefetch_buffer_size=4,
+        image_c=args.image_channels,
+        num_workers=8,
+        prefetch_buffer_size=8,
         seed=args.seed,
-        load_actions=True,
-        action_key="rel_actions",
     )
     initial_state = grain_dataloader._create_initial_state()
     return grain.DataLoaderIterator(grain_dataloader, initial_state)
@@ -326,13 +328,15 @@ def main(args: Args) -> None:
         val_output = {}
         for tag, sampler_conf in regimes:
             sampler_conf.rng_key = jax.random.PRNGKey(4242)
-            t0 = time.time()
+            t0 = time.perf_counter()
 
             pred_frames, floor_frames, gt_frames = sample_video(
                 tokenizer, dynamics, gt.astype(args.dtype), actions, sampler_conf
             )
 
-            dt = time.time() - t0
+            # JAX dispatch is asynchronous, so block before stopping the timer.
+            pred_frames, floor_frames = jax.block_until_ready((pred_frames, floor_frames))
+            dt = time.perf_counter() - t0
             HZ = sampler_conf.horizon
             mse = (jnp.mean((pred_frames[:, -HZ:] - gt_frames[:, -HZ:]) ** 2)).astype(float)
             psnr = (10.0 * jnp.log10(1.0 / jnp.maximum(mse, 1e-12))).astype(float)
@@ -354,7 +358,15 @@ def main(args: Args) -> None:
         tags = [tag for tag, _ in regimes]
 
         N_VIZ = 10
-        metrics_accum = {tag: {"latency": [], "mse": [], "psnr": []} for tag in tags}
+        metrics_accum = {
+            tag: {
+                "latency": [],
+                "latency_post_compile": [],
+                "mse": [],
+                "psnr": [],
+            }
+            for tag in tags
+        }
         viz_gt    = {tag: [] for tag in tags}
         viz_recon = {tag: [] for tag in tags}
         viz_floor = {tag: [] for tag in tags}
@@ -363,9 +375,22 @@ def main(args: Args) -> None:
             val_outputs = val_step(dynamics, tokenizer, batch)
 
             for tag in tags:
-                metrics_accum[tag]["latency"].append(val_outputs[f"{tag}_latency"])
-                metrics_accum[tag]["mse"].append(val_outputs[f"{tag}_mse"])
-                metrics_accum[tag]["psnr"].append(val_outputs[f"{tag}_psnr"])
+                latency = float(val_outputs[f"{tag}_latency"])
+                mse = float(val_outputs[f"{tag}_mse"])
+                psnr = float(val_outputs[f"{tag}_psnr"])
+
+                metrics_accum[tag]["latency"].append(latency)
+                metrics_accum[tag]["mse"].append(mse)
+                metrics_accum[tag]["psnr"].append(psnr)
+                if val_step_count > 0:
+                    metrics_accum[tag]["latency_post_compile"].append(latency)
+
+                phase = "compile+run" if val_step_count == 0 else "post-compile"
+                print(
+                    f"[val][step {val_step_count + 1}/{args.val_steps}][{tag}] "
+                    f"latency={latency:.3f}s phase={phase} mse={mse:.6f} psnr={psnr:.2f}"
+                )
+
                 needed = N_VIZ - sum(a.shape[0] for a in viz_gt[tag])
                 if needed > 0:
                     tag_gt    = np.asarray(val_outputs[f"{tag}_gt"])
@@ -382,6 +407,10 @@ def main(args: Args) -> None:
         val_metrics = {}
         for tag in tags:
             val_metrics[f"{tag}_latency"] = np.mean(metrics_accum[tag]["latency"])
+            post_compile = metrics_accum[tag]["latency_post_compile"]
+            val_metrics[f"{tag}_latency_post_compile"] = (
+                np.mean(post_compile) if post_compile else np.nan
+            )
             val_metrics[f"{tag}_mse"]     = np.mean(metrics_accum[tag]["mse"])
             val_metrics[f"{tag}_psnr"]    = np.mean(metrics_accum[tag]["psnr"])
 
@@ -400,7 +429,8 @@ def main(args: Args) -> None:
     for tag in val_tags:
         print(f"  [{tag}] PSNR: {val_metrics[f'{tag}_psnr']:.2f}  "
               f"MSE: {val_metrics[f'{tag}_mse']:.4f}  "
-              f"Latency: {val_metrics[f'{tag}_latency']:.1f}s")
+              f"Latency(all): {val_metrics[f'{tag}_latency']:.1f}s  "
+              f"Latency(post-compile): {val_metrics[f'{tag}_latency_post_compile']:.1f}s")
 
     # --- Log to wandb ---
     if args.log and jax.process_index() == 0:
@@ -445,4 +475,3 @@ def main(args: Args) -> None:
 if __name__ == "__main__":
     args = tyro.cli(Args)
     main(args)
-

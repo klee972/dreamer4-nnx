@@ -666,8 +666,20 @@ class ModalityAxialBlock(nnx.Module):
         if (self.layer_index + 1) % self.time_every == 0:
             self.temporal_attention.init_cache(input_shape_BNTM)
 
-    @nnx.remat
     def __call__(self, x_BTNM: jax.Array) -> jax.Array:
+        # nnx.remat is only applied in decode mode (inference with KV cache).
+        # During training (decode=False) the rollout runs inside jax.lax.scan,
+        # which is incompatible with nnx.remat's UpdateContext side-effects.
+        # jax.lax.scan handles memory-efficient backward passes on its own.
+        if self.decode:
+            return self._call_remated(x_BTNM)
+        return self._call_body(x_BTNM)
+
+    @nnx.remat
+    def _call_remated(self, x_BTNM: jax.Array) -> jax.Array:
+        return self._call_body(x_BTNM)
+
+    def _call_body(self, x_BTNM: jax.Array) -> jax.Array:
         # --- Spatial attention ---
         z_BTNM = self.spatial_norm(x_BTNM)
         z_BTNM = self.spatial_attention(z_BTNM, sow_weights=self.sow_weights)
@@ -875,7 +887,9 @@ class TokenizerDreamer4(nnx.Module):
         self.dtype = dtype
         self.use_flash_attention = use_flash_attention
         self.pos_emb_type = pos_emb_type
-        dummy_patch_11NP = patchify(jnp.ones((1, 1, self.image_height, self.image_width, self.in_dim)), self.patch_size)
+        dummy_patch_11NP = patchify(
+            jnp.ones((1, 1, self.image_height, self.image_width, self.in_dim)), self.patch_size
+        )
         N = dummy_patch_11NP.shape[2]
         segments = [
             (Modality.IMAGE, N),
@@ -2038,7 +2052,9 @@ class DynamicsDreamer4(nnx.Module):
         # Step size d ∈ {1, 1/2, 1/4, ..., 1/256}
         # We index steps by: step_idx = log2(1/d) ∈ {0, 1, 2, ...,7, 8}
         self.num_step_bins = int(jnp.log2(k_max)) + 1
-        self.step_embed = nnx.Embed(self.num_step_bins, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs)
+        self.step_embed = nnx.Embed(
+            self.num_step_bins, d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+        )
 
         # Signal level τ ∈ {0, 1/d, 2/d, ..., 1 - 1/d} (grid length = 1/d)
         # We use a *shared* table with  bins and only use the first (1/d) entries for a given d.
@@ -2075,21 +2091,24 @@ class DynamicsDreamer4(nnx.Module):
         deterministic: bool = True,
     ):
         spatial_tokens = self.spatial_proj(packed_enc_tokens)  # (B, T, n_spatial, d_model)
-        action_tokens = self.action_encoder(actions)            # (B, T, 1, d_model)
+        token_dtype = spatial_tokens.dtype
+        action_tokens = self.action_encoder(actions).astype(token_dtype)  # (B, T, 1, d_model)
 
         B, T = spatial_tokens.shape[:2]
 
         register_tokens = jnp.broadcast_to(
             self.register_tokens.value[None, None, ...],
             (B, T, self.n_register, self.d_model),
-        )
+        ).astype(token_dtype)
 
-        step_tok   = self.step_embed(step_idxs)[:, :, None, :]    # (B, T, 1, d_model)
-        signal_tok = self.signal_embed(signal_idxs)[:, :, None, :]
+        step_tok = self.step_embed(step_idxs)[:, :, None, :].astype(token_dtype)    # (B, T, 1, d_model)
+        signal_tok = self.signal_embed(signal_idxs)[:, :, None, :].astype(token_dtype)
 
         if self.n_agent > 0:
             if agent_tokens is None:
-                agent_tokens = jnp.zeros((B, T, self.n_agent, self.d_model), dtype=spatial_tokens.dtype)
+                agent_tokens = jnp.zeros((B, T, self.n_agent, self.d_model), dtype=token_dtype)
+            else:
+                agent_tokens = agent_tokens.astype(token_dtype)
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens, agent_tokens]
         else:
             toks = [action_tokens, signal_tok, step_tok, spatial_tokens, register_tokens]
@@ -2140,6 +2159,212 @@ class DynamicsDreamer4(nnx.Module):
         for block in self.transformer.blocks:
             if hasattr(block, 'temporal_attention') and block.temporal_attention.decode:
                 block.temporal_attention.cache_index.value = t_arr
+
+
+class TaskEmbedder(nnx.Module):
+    """Replicate a task embedding across time and agent-token slots."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_agent: int = 1,
+        *,
+        use_ids: bool = True,
+        n_tasks: int = 128,
+        d_task: int = 64,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.n_agent = n_agent
+        self.use_ids = use_ids
+        self.n_tasks = n_tasks
+        self.d_task = d_task
+
+        if self.use_ids:
+            self.task_table = nnx.Embed(
+                self.n_tasks, self.d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            )
+            self.task_proj = None
+        else:
+            self.task_table = None
+            self.task_proj = nnx.Linear(
+                self.d_task, self.d_model, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+            )
+
+        self.agent_base = nnx.Param(
+            nnx.initializers.normal(0.02)(rngs.params(), (self.d_model,))
+        )
+
+    def __call__(self, task: jnp.ndarray, B: int, T: int) -> jnp.ndarray:
+        if self.use_ids:
+            emb = self.task_table(task)
+        else:
+            emb = self.task_proj(task)
+        x = emb + self.agent_base.value[None, :]
+        x = x[:, None, None, :]
+        return jnp.broadcast_to(x, (B, T, self.n_agent, self.d_model))
+
+
+class PolicyHeadMTP(nnx.Module):
+    """Multi-token categorical action prediction from pooled agent readouts."""
+
+    def __init__(
+        self,
+        d_model: int,
+        action_dim: int,
+        *,
+        L: int = 8,
+        kind: str = "categorical",
+        mlp_ratio: int = 2,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.action_dim = action_dim
+        self.L = L
+        self.kind = kind
+        self.projector = MLP(
+            d_model=d_model,
+            mlp_ratio=mlp_ratio,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.out = nnx.LinearGeneral(
+            d_model,
+            (L, action_dim),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+        del deterministic
+        x = self.projector(h_t)
+        return self.out(x)
+
+
+class PolicyHeadContinuousMTP(nnx.Module):
+    """Multi-token continuous action prediction from pooled agent readouts."""
+
+    def __init__(
+        self,
+        d_model: int,
+        action_dim: int,
+        *,
+        L: int = 8,
+        mlp_ratio: int = 2,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.action_dim = action_dim
+        self.L = L
+        self.projector = MLP(
+            d_model=d_model,
+            mlp_ratio=mlp_ratio,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.out = nnx.LinearGeneral(
+            d_model,
+            (L, action_dim),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> jnp.ndarray:
+        del deterministic
+        x = self.projector(h_t)
+        return self.out(x)
+
+
+class RewardHeadMTP(nnx.Module):
+    """Multi-token symexp two-hot reward prediction."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        L: int = 8,
+        num_bins: int = 101,
+        mlp_ratio: int = 2,
+        log_low: float = -8.0,
+        log_high: float = 8.0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.L = L
+        self.num_bins = num_bins
+        self.log_low = log_low
+        self.log_high = log_high
+        self.projector = MLP(
+            d_model=d_model,
+            mlp_ratio=mlp_ratio,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.out = nnx.LinearGeneral(
+            d_model,
+            (L, num_bins),
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del deterministic
+        x = self.projector(h_t)
+        logits = self.out(x)
+        centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins, dtype=logits.dtype)
+        return logits, centers_log
+
+
+class ValueHead(nnx.Module):
+    """Symexp two-hot value prediction."""
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        num_bins: int = 101,
+        mlp_ratio: int = 2,
+        log_low: float = -8.0,
+        log_high: float = 8.0,
+        dtype: jnp.dtype = jnp.float32,
+        param_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.num_bins = num_bins
+        self.log_low = log_low
+        self.log_high = log_high
+        self.projector = MLP(
+            d_model=d_model,
+            mlp_ratio=mlp_ratio,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        self.out = nnx.Linear(
+            d_model, num_bins, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+        )
+
+    def __call__(self, h_t: jnp.ndarray, *, deterministic: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+        del deterministic
+        x = self.projector(h_t)
+        logits = self.out(x)
+        centers_log = jnp.linspace(self.log_low, self.log_high, self.num_bins, dtype=logits.dtype)
+        return logits, centers_log
 
 
 
@@ -2333,4 +2558,3 @@ if __name__ == "__main__":
     # → {"keyboard": {"keys": [...]}, "mouse": {"dx": ..., "dy": ..., "buttons": [...]}}
     print(raw_out)
     pdb.set_trace()
-

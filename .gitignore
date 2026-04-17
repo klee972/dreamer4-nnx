@@ -3,6 +3,7 @@
 *.png
 *.gif
 *.mp4
+*.out
 !media/*.mp4
 
 zzz*

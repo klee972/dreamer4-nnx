@@ -29,7 +29,7 @@ uv sync
 ## Project Structure
 
 ```
-jasmine/
+dreamer4-nnx/
 ├── jasmine/
 │   ├── dreamer4/                 # Dreamer4 training scripts
 │   │   ├── train_tokenizer.py

@@ -51,7 +51,7 @@ Following is the instruction for Minecraft data preparation. For CALVIN, please 
 
 Prepare the Minecraft dataset by running the following steps in order.
 
-All scripts should be run from the project root (`jasmine`).
+All scripts should be run from the project root.
 
 ### 1. Download Index Files
 
